@@ -1,0 +1,765 @@
+/*
+================================ /// Super Duper Vanilla v1.3.8 /// ================================
+
+    Developed by Eldeston, presented by FlameRender (C) Studios.
+
+    Copyright (C) 2023 Eldeston | FlameRender (C) Studios License
+
+
+    By downloading this content you have agreed to the license and its terms of use.
+
+================================ /// Super Duper Vanilla v1.3.8 /// ================================
+*/
+
+#define WATER
+
+/// Buffer features: TAA jittering, complex shading, animation, water noise, PBR, and world curvature
+
+/// -------------------------------- /// Vertex Shader /// -------------------------------- ///
+
+#ifdef VERTEX
+    flat out int blockId;
+
+    out vec2 lmCoord;
+    out vec3 blockLightColor;
+    out vec2 texCoord;
+    out vec2 waterNoiseUv;
+
+    out float vertexAO;
+
+    out vec3 vertexColor;
+    out vec3 vertexFeetPlayerPos;
+    out vec3 vertexWorldPos;
+
+    out mat3 TBN;
+
+    #if defined NORMAL_GENERATION || defined PARALLAX_OCCLUSION
+        flat out vec2 vTexCoordScale;
+        flat out vec2 vTexCoordPos;
+
+        out vec2 vTexCoord;
+    #endif
+
+    uniform vec3 cameraPosition;
+
+    uniform mat4 gbufferModelViewInverse;
+
+    #if defined WATER_ANIMATION || defined WORLD_CURVATURE
+        uniform mat4 gbufferModelView;
+    #endif
+    
+    #if ANTI_ALIASING == 2
+        uniform int frameMod;
+
+        uniform float pixelWidth;
+        uniform float pixelHeight;
+
+        #include "/lib/utility/taaJitter.glsl"
+    #endif
+
+    #ifdef WATER_ANIMATION
+        uniform float vertexFrameTime;
+
+        #include "/lib/vertex/waveWater.glsl"
+    #endif
+
+    attribute vec3 mc_Entity;
+
+    attribute vec4 at_tangent;
+
+    #if defined NORMAL_GENERATION || defined PARALLAX_OCCLUSION
+        attribute vec2 mc_midTexCoord;
+    #endif
+
+    #include "/lib/utility/coloredLighting.glsl"
+
+    void main(){
+        // Get block id
+        blockId = int(mc_Entity.x);
+        // Get buffer texture coordinates
+        texCoord = (gl_TextureMatrix[0] * gl_MultiTexCoord0).xy;
+        // Get vertex color
+        vertexColor = gl_Color.rgb;
+
+        // Lightmap fix for mods + Colored Lighting support
+        correctedLightMap();
+
+        // Get vertex normal
+        vec3 vertexNormal = fastNormalize(gl_Normal);
+        // Get vertex tangent
+        vec3 vertexTangent = fastNormalize(at_tangent.xyz);
+
+        // Get vertex view position
+        vec3 vertexViewPos = mat3(gl_ModelViewMatrix) * gl_Vertex.xyz + gl_ModelViewMatrix[3].xyz;
+        // Get vertex feet player position
+        vertexFeetPlayerPos = mat3(gbufferModelViewInverse) * vertexViewPos + gbufferModelViewInverse[3].xyz;
+
+        // Get world position
+        vertexWorldPos = vertexFeetPlayerPos + cameraPosition;
+
+        // Get water noise uv position
+        waterNoiseUv = vertexWorldPos.xz * waterTileSizeInv;
+
+        // Calculate TBN matrix
+	    TBN = mat3(gbufferModelViewInverse) * (gl_NormalMatrix * mat3(vertexTangent, cross(vertexTangent, vertexNormal) * sign(at_tangent.w), vertexNormal));
+
+        #if defined NORMAL_GENERATION || defined PARALLAX_OCCLUSION
+            vec2 midCoord = (gl_TextureMatrix[0] * vec4(mc_midTexCoord, 0, 0)).xy;
+            vec2 texMinMidCoord = texCoord - midCoord;
+
+            vTexCoordScale = abs(texMinMidCoord) * 2.0;
+            vTexCoordPos = min(texCoord, midCoord - texMinMidCoord);
+            vTexCoord = sign(texMinMidCoord) * 0.5 + 0.5;
+        #endif
+
+        #ifdef WATER_ANIMATION
+            if(gl_Normal.y > 0.5)
+                vertexFeetPlayerPos = getWaterWave(vertexFeetPlayerPos, vertexWorldPos.xz, mc_Entity.x, vertexFrameTime);
+        #endif
+
+        #ifdef WORLD_CURVATURE
+            // Apply curvature distortion
+            vertexFeetPlayerPos.y -= dot(vertexFeetPlayerPos.xz, vertexFeetPlayerPos.xz) * worldCurvatureInv;
+        #endif
+
+        #if defined WATER_ANIMATION || defined WORLD_CURVATURE
+            // Convert back to vertex view position
+            vertexViewPos = mat3(gbufferModelView) * vertexFeetPlayerPos + gbufferModelView[3].xyz;
+        #endif
+
+        // Convert to clip position and output as final position
+        // gl_Position = gl_ProjectionMatrix * vertexViewPos;
+        gl_Position.xyz = getMatScale(mat3(gl_ProjectionMatrix)) * vertexViewPos;
+        gl_Position.z += gl_ProjectionMatrix[3].z;
+
+        gl_Position.w = -vertexViewPos.z;
+
+        #if ANTI_ALIASING == 2
+            gl_Position.xy += jitterPos(gl_Position.w);
+        #endif
+    }
+
+    // Backwards-compatible ripple time/persistence uniforms used by earlier water logic
+    // (optional external override for ripple time and persistence window)
+    uniform float fragmentFrameTime_ripple;
+
+#ifdef RAIN_PERSISTENCE_UNIFORM
+    uniform float lastRainTime;
+    uniform float rainPersistenceSeconds;
+#endif
+#endif
+
+/// -------------------------------- /// Fragment Shader /// -------------------------------- ///
+
+#ifdef FRAGMENT
+    /* RENDERTARGETS: 4,1,2,3 */
+    layout(location = 0) out vec4 sceneColOut; // colortex4
+    layout(location = 1) out vec3 normalDataOut; // colortex1
+    layout(location = 2) out vec3 albedoDataOut; // colortex2
+    layout(location = 3) out vec3 materialDataOut; // colortex3
+
+    flat in int blockId;
+
+    in vec2 lmCoord;
+    in vec3 blockLightColor;
+    in vec2 texCoord;
+    in vec2 waterNoiseUv;
+
+    in vec3 vertexColor;
+    in vec3 vertexFeetPlayerPos;
+    in vec3 vertexWorldPos;
+
+    in mat3 TBN;
+
+    #if defined NORMAL_GENERATION || defined PARALLAX_OCCLUSION
+        flat in vec2 vTexCoordScale;
+        flat in vec2 vTexCoordPos;
+
+        in vec2 vTexCoord;
+    #endif
+
+    uniform int isEyeInWater;
+
+    #ifdef DISTANT_HORIZONS
+        uniform float borderFar;
+        uniform vec3 cameraPosition;
+    #else
+        // Ensure camera position is available for ripple chunk-culling even
+        // when distant-horizons is not enabled.
+        uniform vec3 cameraPosition;
+    #endif
+
+    // Optional culling uniforms: set `rippleCullDistance` > 0 to enable distance culling.
+    uniform float rippleCullDistance;
+    // Optional: if > 0, treated as number of chunks to cull (1 chunk = 16 blocks)
+    uniform float rippleCullChunks;
+
+    uniform float nightVision;
+    uniform float lightningFlash;
+
+    uniform float near;
+
+    uniform sampler2D depthtex1;
+    uniform sampler2D gtexture;
+
+    #ifndef FORCE_DISABLE_WEATHER
+        uniform float rainStrength;
+    #endif
+
+    #if WATER_INTERACTION == 1
+        uniform vec3 waterEnteredPosition;
+        uniform float waterEnteredTime;
+        uniform vec3 waterEnteredVelocity;
+        uniform vec3 waterExitedPosition;
+        uniform float waterExitedTime;
+        uniform vec3 waterExitedVelocity;
+        uniform float frameTimeCounter;
+    #endif
+
+    #if defined SHADOW_FILTER && ANTI_ALIASING >= 2
+        uniform float frameFract;
+    #endif
+
+    #ifndef FORCE_DISABLE_DAY_CYCLE
+        uniform float dayCycle;
+        uniform float dayCycleAdjust;
+        uniform float twilightPhase;
+    #endif
+
+    #ifdef WORLD_VANILLA_FOG_COLOR
+        uniform vec3 fogColor;
+    #endif
+
+    #ifdef WORLD_CUSTOM_SKYLIGHT
+        const float eyeBrightFact = WORLD_CUSTOM_SKYLIGHT;
+    #else
+        uniform float eyeSkylight;
+        
+        float eyeBrightFact = eyeSkylight;
+    #endif
+
+    #ifdef WORLD_LIGHT
+        uniform float shdFade;
+
+        uniform mat4 shadowModelView;
+
+        #ifdef SHADOW_MAPPING
+            uniform mat4 shadowProjection;
+
+            #include "/lib/lighting/shdMapping.glsl"
+        #endif
+
+        #include "/lib/lighting/GGX.glsl"
+    #endif
+
+    #include "/lib/PBR/dataStructs.glsl"
+
+    #if PBR_MODE <= 1
+        #include "/lib/PBR/integratedPBR.glsl"
+    #else
+        #include "/lib/PBR/labPBR.glsl"
+    #endif
+
+    #include "/lib/utility/noiseFunctions.glsl"
+
+    #if defined WATER_NORMAL || defined WATER_NOISE
+        uniform float fragmentFrameTime;
+
+        #include "/lib/surface/water.glsl"
+    #endif
+
+    // Rain ripple helpers (terrain-derived implementation for water)
+    uniform float globalTime;
+
+    // Optional uniforms for player/boat trail effect
+    // Provide `prevCameraPosition` (engine must set) to create a directional trail
+    uniform vec3 prevCameraPosition;
+    uniform vec3 relativeEyePosition;
+    // Optional: if available, provide the player/world entity position to center the wake
+    uniform vec3 playerPosition;
+    // Tunables (engine can override via uniform): intensity, width, length, frequency
+    uniform float trailIntensity; // overall amplitude multiplier
+    uniform float trailWidth;     // lateral falloff (meters)
+    uniform float trailLength;    // how far behind the camera the trail extends (meters)
+    uniform float trailFreq;      // spatial frequency of ripples along trail
+    // Looping controls for the trail (optional)
+    uniform float trailLoopPeriod; // seconds (0 -> auto)
+    uniform float trailSpeed;      // speed at which rings expand (meters/sec)
+    // Touch detection threshold (meters)
+    uniform float trailTouchThreshold;
+    // Fade distance (meters) used to smoothly appear the trail when camera approaches
+    uniform float trailAppearFade;
+    // Camera view mode: 0=default, 2=third-person detection
+    uniform int cameraViewMode;
+    // Third-person camera params (set by engine when in 3rd-person)
+    uniform vec3 thirdPersonCameraPosition;
+    uniform float thirdPersonTouchThreshold;
+    uniform float thirdPersonFade;
+
+    // minimum rain strength to consider (match RAIN_MIN in main)
+    const float RAIN_MIN_DEF = 0.12;
+
+#ifdef RAIN_TRANSITION_UNIFORM
+    // Optional uniforms provided by the engine to drive a time-based rain transition
+    uniform float lastRainToggleTime; // time of last rain state toggle
+    uniform int lastRainToggleState;  // 1 if toggled TO raining, 0 if toggled TO not raining
+    uniform float rainTransitionSeconds; // transition duration in seconds
+#endif
+
+    // simple 2D hash
+    float _hash12(vec2 p){
+        return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453123);
+    }
+
+    vec2 _hash22(vec2 p){
+        return fract(sin(vec2(dot(p,vec2(127.1,311.7)), dot(p,vec2(269.5,183.3)))) * 43758.5453);
+    }
+
+    // Ripple height field (coarse procedural centers). Returns scalar height used to derive rings.
+    // p: world xz coords, t: time, scale: density control
+    float rippleField(vec2 p, float t, float scale){
+        p *= scale;
+        vec2 ip = floor(p);
+
+        float h = 0.0;
+        // sample 3x3 neighbourhood of coarse cells for nearby ripple sources
+        // shared frequency/speed for all cells so size and animation match
+        const float RIPPLE_FREQ = 1.0;
+        const float RIPPLE_SPEED = 1.4;
+
+        for(int oy=-1; oy<=1; oy++){
+            for(int ox=-1; ox<=1; ox++){
+                vec2 cell = ip + vec2(ox, oy);
+                vec2 center = cell + _hash22(cell);
+                vec2 d = p - center;
+                float dist = length(d) + 1e-5;
+
+                float freq = RIPPLE_FREQ;
+                float speed = RIPPLE_SPEED;
+
+                float cellSeed = _hash12(cell) * 1.31;
+                float period = 0.8;
+
+                const int RINGS_PER_DROP = 3;
+                const float RING_GAP = 0.20;
+                const float RING_WIDTH = 0.025;
+                const float RING_BLEND_BOOST = 0.1;
+
+                float lifetime = (float(RINGS_PER_DROP) * RING_GAP) / max(0.0001, RIPPLE_SPEED) + 0.5;
+                float fadeIn = min(0.35, lifetime * 0.35);
+                float fadeOut = min(0.35, lifetime * 0.35);
+
+                float age = mod(t + cellSeed, period);
+                if(age <= lifetime){
+                    float envTime = smoothstep(0.0, fadeIn, age) * (1.0 - smoothstep(lifetime - fadeOut, lifetime, age));
+
+                    float ringsSum = 0.0;
+                    for(int ri=0; ri<RINGS_PER_DROP; ri++){
+                        float radius = age * speed - float(ri) * RING_GAP;
+                        if(radius > -RING_WIDTH){
+                            float d = dist - radius;
+                            float pulse = exp(- (d*d) / (RING_WIDTH * RING_WIDTH));
+                            ringsSum += pulse * (1.0 - ringsSum);
+                        }
+                    }
+
+                    float envDist = exp(-dist * 1.0);
+                    float cellContrib = ringsSum * envDist * envTime * 0.9 / (1.0 + dist*2.5) * RING_BLEND_BOOST;
+                    h += cellContrib * (1.0 - h);
+                }
+            }
+        }
+        return h * 0.35;
+    }
+
+    vec3 applyRainRipples(in vec3 baseNormal, in vec2 uv, in vec3 worldPos, in float strength, out float outRough, out vec2 outRefract){
+        float t;
+        #if defined LAVA_NOISE || defined SCULK_NOISE
+            t = fragmentFrameTime;
+        #else
+            t = globalTime;
+        #endif
+
+        vec2 p = worldPos.xz;
+        float sc1 = 3.8;
+        float sc2 = 4.8;
+        float sc3 = 5.0;
+        float h0 = rippleField(p, t, sc1) + 0.35 * rippleField(p + vec2(12.34,45.67), t, sc2) + 0.35 * rippleField(p + vec2(24.68,91.34), t, sc3);
+        const float eps = 0.0155;
+        float hx = rippleField(p + vec2(eps,0.0), t, sc1) + 0.35 * rippleField(p + vec2(12.34+eps,45.67), t, sc2) + 0.35 * rippleField(p + vec2(24.68+eps,91.34), t, sc3);
+        float hy = rippleField(p + vec2(0.0,eps), t, sc1) + 0.35 * rippleField(p + vec2(12.34,45.67+eps), t, sc2) + 0.35 * rippleField(p + vec2(24.68,91.34+eps), t, sc3);
+
+        vec2 grad = vec2((hx - h0) / eps, (hy - h0) / eps);
+
+        const float RAIN_FADE = 0.9;
+        float rainMix = smoothstep(RAIN_MIN_DEF, RAIN_MIN_DEF + RAIN_FADE, strength);
+
+    #ifdef RAIN_TRANSITION_UNIFORM
+        if(rainTransitionSeconds > 0.0){
+            float dt = fragmentFrameTime - lastRainToggleTime;
+            float tnorm = clamp(dt / rainTransitionSeconds, 0.0, 1.0);
+            float transMix = (lastRainToggleState == 1) ? smoothstep(0.0, 1.0, tnorm) : (1.0 - smoothstep(0.0, 1.0, tnorm));
+            rainMix = max(rainMix, transMix);
+        }
+    #endif
+
+        grad *= strength * 0.5 * rainMix;
+
+        vec3 tng = normalize(TBN[0]);
+        vec3 bng = normalize(TBN[1]);
+
+        vec3 nrm = baseNormal - tng * grad.x - bng * grad.y;
+        nrm = normalize(nrm);
+
+        outRough = max(0.0, abs(h0) * strength * 0.15) * rainMix;
+
+        vec3 blended = normalize(mix(baseNormal, nrm, rainMix));
+
+        const float REFRACT_STRENGTH = 0.035;
+        vec2 uvOffset = vec2(grad.x, grad.y) * REFRACT_STRENGTH * rainMix;
+        outRefract = uvOffset;
+
+        return blended;
+    }
+
+    float trailFieldLoop(vec2 rel, float t, float speed, float period, float R){
+        float dist = length(rel);
+        if(dist > R) return 0.0;
+
+        float ringGap = (trailFreq > 0.0) ? trailFreq : 0.1;
+        float ringWidth = 0.28;
+        const int RINGS_PER_LOOP = 3;
+
+        float per = period;
+        if(per <= 0.0){
+            per = (ringGap * float(RINGS_PER_LOOP)) / max(0.0001, speed);
+        }
+
+        float phase = fract(t / per);
+        float ringBase = phase * R;
+
+        float h = 0.0;
+        for(int ri = 0; ri < RINGS_PER_LOOP; ri++){
+            float rk = ringBase - float(ri) * ringGap;
+            if(rk < 0.0) rk += R;
+            float d = abs(dist - rk);
+            float pulse = exp(- (d * d) / (ringWidth * ringWidth));
+            h += pulse * (1.0 - h);
+        }
+
+        float env = 1.0 - smoothstep(R * 0.6, R, dist);
+        return h * env;
+    }
+
+    float trailWave(vec2 p, vec2 camPos, vec2 camPrevPos, float t){
+        vec2 rel = p - camPos;
+        float R = (trailLength > 0.0) ? trailLength : 2.0;
+
+        float speed = (trailSpeed > 0.0) ? trailSpeed : 0.1;
+        float period = (trailLoopPeriod > 0.0) ? trailLoopPeriod : 0.0;
+
+        float base = trailFieldLoop(rel, t, speed, period, R);
+
+        float lf = 0.12 * (sin(t * 0.4 - length(rel) * 0.2) * 0.5 + 0.5);
+
+        float inten = (trailIntensity > 0.0) ? trailIntensity : 0.5;
+        return clamp(base * inten * 1.0 + lf * 0.06, 0.0, 1.0);
+    }
+
+    #if defined ENVIRONMENT_PBR && !defined FORCE_DISABLE_WEATHER
+        uniform float isPrecipitationRain;
+
+        #include "/lib/PBR/enviroPBR.glsl"
+    #endif
+
+    #include "/lib/util/waterColoring.glsl"
+    #include "/lib/lighting/complexShadingForward.glsl"
+
+    void main(){
+	    // Declare materials
+	    dataPBR material;
+        getPBR(material, blockId);
+
+        if(blockId == 11102 || blockId == 12100){
+            float blockDepth = near / (1.0 - gl_FragCoord.z) - near / (1.0 - texelFetch(depthtex1, ivec2(gl_FragCoord.xy), 0).x);
+            float edgeBrightness = exp2((blockDepth + 0.0625) * 8.0);
+
+            // Water
+            if(blockId == 11102){
+                float waterNoise = WATER_BRIGHTNESS;
+
+                #if defined WATER_NORMAL
+                    vec4 waterData = H2NWater(waterNoiseUv);
+
+                    float normalStrength = 1.8;
+                    #ifndef FORCE_DISABLE_WEATHER
+                        normalStrength *= (1.0 - rainStrength * 0.35);
+                    #endif
+
+                    vec3 nfield = vec3(waterData.x, waterData.y, 1.0) * normalStrength;
+                    material.normal = fastNormalize(TBN * nfield);
+
+                    float weatherFactor = 0.0;
+                    #ifndef FORCE_DISABLE_WEATHER
+                        weatherFactor = rainStrength;
+                    #endif
+                    float rainMask = step(0.01, weatherFactor) * step(0.1, lmCoord.y);
+
+                    float persistFactor = 0.0;
+                    #ifdef RAIN_PERSISTENCE_UNIFORM
+                        float rippleTime_l = fragmentFrameTime_ripple;
+                        if(rippleTime_l == 0.0) rippleTime_l = fragmentFrameTime;
+                        float since = rippleTime_l - lastRainTime;
+                        if(since > 0.0 && since < rainPersistenceSeconds){
+                            persistFactor = 1.0 - (since / rainPersistenceSeconds);
+                        }
+                    #endif
+
+                    const float base_intensity = 0.05;
+                    float intensityFactor = max(weatherFactor, persistFactor) + base_intensity;
+
+                    vec3 outNormal = material.normal;
+                    float roughAdj = 0.0;
+                    vec2 refractUV = vec2(0.0);
+
+                    #ifndef FORCE_DISABLE_WEATHER
+                        float s = clamp(intensityFactor  * rainMask, 0.0, 1.0);
+                        if(isEyeInWater == 0 && s > RAIN_MIN_DEF){
+                            outNormal = applyRainRipples(material.normal, texCoord, vertexWorldPos, s, roughAdj, refractUV);
+                        }
+                    #endif
+
+                    // Water trail from player/camera movement (centered radial wake)
+                    {
+                        vec3 tng = normalize(TBN[0]);
+                        vec3 bng = normalize(TBN[1]);
+
+                        vec3 eyeWorldPos = cameraPosition - relativeEyePosition;
+                        vec2 camPos2 = (length(playerPosition) > 0.001) ? playerPosition.xz : eyeWorldPos.xz;
+                        vec2 prevCam2 = (length(prevCameraPosition) > 0.001) ? prevCameraPosition.xz : camPos2;
+
+                        float trailTime = 0.0;
+#if defined WATER_NORMAL || defined WATER_NOISE
+                        trailTime = fragmentFrameTime;
+#else
+                        trailTime = globalTime;
+#endif
+
+                        // --- Improved water touch detection ---
+                        // Gate on player feet Y vs water surface Y at this fragment.
+                        // This correctly detects wading and swimming without relying
+                        // on camera height, which was always too far above the surface.
+                        float touchMix = 0.0;
+                        vec3 playerWorld = (length(playerPosition.xz) > 0.001)
+                            ? playerPosition
+                            : eyeWorldPos;
+
+                        if(isEyeInWater == 1){
+                            // Fully submerged
+                            touchMix = 1.0;
+                        } else {
+                            // feetAboveWater <= 0 → wading/swimming, > 1.5 → above water
+                            float feetAboveWater = playerWorld.y - vertexWorldPos.y;
+                            touchMix = 1.0 - smoothstep(-0.2, 1.5, feetAboveWater);
+                        }
+
+                        // Third-person detection (unchanged from original)
+                        float touchMix3rd = 0.0;
+                        if(cameraViewMode == 2){
+                            vec3 tp = thirdPersonCameraPosition;
+                            float camDist3 = tp.y - vertexWorldPos.y;
+                            float thr3 = (thirdPersonTouchThreshold > 0.0) ? thirdPersonTouchThreshold : 0.15;
+                            float fade3 = (thirdPersonFade > 0.0) ? thirdPersonFade : max(0.01, thr3 * 1.25);
+                            float nearVal3 = (thr3 - camDist3) / fade3;
+                            nearVal3 = clamp(nearVal3, 0.0, 1.0);
+                            touchMix3rd = pow(nearVal3, 3.0);
+                            float horiz = length(tp.xz - vertexWorldPos.xz);
+                            float prox = 1.0 - smoothstep(0.0, thr3 * 3.0, horiz);
+                            touchMix3rd *= prox;
+                        }
+
+                        float finalTouchMix = (cameraViewMode == 2) ? touchMix3rd : touchMix;
+
+                        // centerMix: sharpened version of touchMix to control center blending
+                        vec2 centerPlayer = (length(playerPosition) > 0.001) ? playerPosition.xz : eyeWorldPos.xz;
+                        vec2 centerCamera = eyeWorldPos.xz;
+                        float centerMix = pow(clamp(finalTouchMix, 0.0, 1.0), 2.0);
+                        camPos2 = mix(centerPlayer, centerCamera, centerMix);
+                        prevCam2 = (length(prevCameraPosition) > 0.001) ? prevCameraPosition.xz : camPos2;
+
+                        // trail scalar (height-like) at this fragment, gated by finalTouchMix
+                        float htrail = trailWave(vertexWorldPos.xz, camPos2, prevCam2, trailTime) * finalTouchMix;
+                        if(htrail > 0.0005){
+                            const float epsT = 0.12;
+                            float h0 = trailWave(vertexWorldPos.xz, camPos2, prevCam2, trailTime);
+                            float hx = trailWave(vertexWorldPos.xz + vec2(epsT,0.0), camPos2, prevCam2, trailTime);
+                            float hy = trailWave(vertexWorldPos.xz + vec2(0.0,epsT), camPos2, prevCam2, trailTime);
+
+                            vec2 gradt = vec2((hx - h0) / epsT, (hy - h0) / epsT);
+
+                            float str = (trailIntensity > 0.0) ? trailIntensity : 1.5;
+                            gradt *= clamp(str * 1.0, 0.0, 3.0);
+
+                            vec3 trailN = normalize(material.normal - tng * gradt.x - bng * gradt.y);
+
+                            float waveAmp = 0.0;
+                            #ifdef WATER_NORMAL
+                                waveAmp = clamp(abs(waterData.w), 0.0, 1.0);
+                            #endif
+
+                            float blendFactor = smoothstep(0.01, 0.9, htrail) * (1.0 - waveAmp * 0.6);
+
+                            outNormal = normalize(mix(outNormal, trailN, clamp(blendFactor * str, 0.0, 1.0)));
+                        }
+                    }
+
+                    #if WATER_INTERACTION == 1
+                        // Apply water ripple effect from player entering/exiting water
+                        if (length(outNormal) > 0.0001) {
+                            vec3 waterPlayerPostion = waterExitedPosition;
+                            float waterTime = waterExitedTime;
+                            vec3 playerVelocity = waterExitedVelocity;
+                            if (isEyeInWater == 1) {
+                                waterPlayerPostion = waterEnteredPosition;
+                                waterTime = waterEnteredTime;
+                                playerVelocity = waterEnteredVelocity;
+                            }
+                            
+                            float distFromWaterPos = length(vertexWorldPos - waterPlayerPostion);
+                            float maxWaveDist = 3.5;
+                            if (distFromWaterPos < maxWaveDist) {
+                                float newTime = frameTimeCounter - waterTime;
+                                newTime *= 2.15;
+                                
+                                float smoothDistFromWaterPos = smoothstep(maxWaveDist, 0.0, distFromWaterPos);
+                                float waveWidth = 0.2;
+                                float waveHeight = 0.3 * smoothstep(2.0, 20.0, length(playerVelocity)) + 0.5;
+                                
+                                float enterWave = waveHeight * smoothstep(newTime - waveWidth, newTime, distFromWaterPos-0.1) * smoothstep(newTime + waveWidth, newTime, distFromWaterPos-0.1) * smoothDistFromWaterPos;
+                                
+                                outNormal.y = enterWave + (1.0 - enterWave) * outNormal.y;
+                                outNormal = normalize(outNormal);
+                            }
+                        }
+                    #endif
+
+                    // Store (possibly) perturbed normal for output
+                    material.normal = outNormal;
+
+                    #ifdef WATER_NOISE
+                        waterNoise *= squared(0.128 + waterData.w * 0.5);
+                    #endif
+
+                    // ----------------------------------------------------------
+                    // Reworked water tinting — physically-motivated Beer-Lambert
+                    // absorption. No magic teal/cyan injection.
+                    // ----------------------------------------------------------
+                    float depthFactor = clamp(blockDepth * 0.06, 0.0, 1.0);
+
+                    // Natural water: non-metallic, very smooth (high reflectivity)
+                    material.metallic = 0.0;
+                    float baseSmooth = mix(0.90, 0.95, depthFactor);
+                    #ifndef FORCE_DISABLE_WEATHER
+                        baseSmooth -= rainStrength * 0.08;
+                    #endif
+                    material.smoothness = clamp(baseSmooth, 0.72, 0.96);
+
+                #elif defined WATER_NOISE
+                    float waterData = getCellNoise(waterNoiseUv);
+
+                    waterNoise *= squared(0.128 + waterData * 0.5);
+                #endif
+
+                // ================================================================
+                // ECLIPSE-DERIVED WATER COLORING
+                // Water albedo is driven by absorption coefficients.
+                // The scatter colour (what's NOT absorbed) gives vivid blue/teal.
+                // The composite pass applies physical absorption to terrain behind.
+                // ================================================================
+
+                #ifdef WATER_STYLIZE_ABSORPTION
+                    if(isEyeInWater == 0){
+                        float _depthBright = exp2(blockDepth * 0.25);
+                        material.albedo.a = fastSqrt(material.albedo.a) * (1.0 - _depthBright);
+                    }
+                #endif
+
+                #if defined WATER_NORMAL || defined WATER_NOISE
+                {
+                    #ifdef FORCE_DISABLE_DAY_CYCLE
+                        float _dayAmt = 1.0;
+                    #else
+                        float _dayAmt = clamp(dayCycleAdjust, 0.0, 1.0);
+                    #endif
+
+                    // Eclipse absorption-derived colour: vivid blue/teal from absorption spectrum
+                    vec3 _waterCol = _sildurWaterColor(blockDepth, _dayAmt);
+
+                    #ifndef FORCE_DISABLE_WEATHER
+                        _waterCol = mix(_waterCol, _waterCol * vec3(0.6, 0.7, 0.8), rainStrength * 0.4);
+                    #endif
+
+                    material.albedo.rgb = _waterCol * waterNoise;
+                    material.metallic   = 0.0;
+                    material.smoothness = 0.96;
+                    material.emissive   = 0.0;
+
+                    // DH seam fix: blend toward DH water color at the chunk boundary.
+                    // Must be AFTER _sildurWaterColor so it actually takes effect.
+                    #ifdef DISTANT_HORIZONS
+                    {
+                        float viewDist = length(vertexWorldPos - cameraPosition);
+                        float dhStart = borderFar * 0.80;
+                        float dhEnd   = borderFar * 1.00;
+                        float dhFade  = smoothstep(dhStart, dhEnd, viewDist);
+
+                        if(dhFade > 0.0){
+                            // Mirror what dh_water.glsl produces: _sildurWaterColor at depth=0
+                            vec3 dhMatchColor = _sildurWaterColor(0.0, _dayAmt) * waterNoise;
+                            #ifndef FORCE_DISABLE_WEATHER
+                                dhMatchColor = mix(dhMatchColor, dhMatchColor * vec3(0.6, 0.7, 0.8), rainStrength * 0.4);
+                            #endif
+                            material.albedo.rgb = mix(material.albedo.rgb, dhMatchColor, dhFade);
+                        }
+                    }
+                    #endif
+                }
+                #endif
+
+                #ifdef WATER_FOAM
+                    material.albedo = min(vec4(1), material.albedo + edgeBrightness);
+                #endif
+            }
+
+            // Nether portal
+            else material.albedo.rgb = min(vec3(1), material.albedo.rgb * (0.5 + edgeBrightness * 2.0));
+        }
+
+        material.albedo.rgb = toLinear(material.albedo.rgb);
+
+        #if defined ENVIRONMENT_PBR && !defined FORCE_DISABLE_WEATHER
+            if(blockId != 11102) enviroPBR(material, TBN[2]);
+        #endif
+
+        // Write to HDR scene color
+        sceneColOut = complexShadingForward(material);
+
+        // Seam fix: fade wave normals toward flat surface normal near the DH boundary.
+        // DH water always writes a flat vertexNormal — if regular water still has
+        // animated normals right up to the edge, the reflection direction jumps hard.
+        vec3 outNormal = material.normal;
+        #if (defined WATER_NORMAL || defined WATER_NOISE) && defined DISTANT_HORIZONS
+            if(blockId == 11102){
+                float viewDist = length(vertexWorldPos - cameraPosition);
+                float nFadeStart = borderFar * 0.92;
+                float nFadeEnd   = borderFar * 1.00;
+                float nFade      = smoothstep(nFadeStart, nFadeEnd, viewDist);
+                outNormal = normalize(mix(material.normal, TBN[2], nFade));
+            }
+        #endif
+
+        normalDataOut = outNormal;
+        albedoDataOut = material.albedo.rgb;
+        materialDataOut = vec3(material.metallic, material.smoothness, 0.5);
+    }
+#endif
