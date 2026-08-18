@@ -1,0 +1,279 @@
+// Backwards-compatible wrapper: older shaders call the function without `puddleBlend`.
+// Provide an overload that forwards to the newer implementation with `puddleBlend = 0.0`.
+
+// Forward-declare the full overload to avoid forward-reference/overload resolution
+// issues on some GLSL compilers/drivers.
+vec3 complexShadingDeferred(in vec3 sceneCol, in vec3 screenPos, in vec3 viewPos, in vec3 normal, in vec3 albedo, in vec3 dither, in float viewDotInvSqrt, in float metallic, in float smoothness, in float puddleBlend, in bool realSky);
+vec3 complexShadingDeferred(in vec3 sceneCol, in vec3 screenPos, in vec3 viewPos, in vec3 normal, in vec3 albedo, in vec3 dither, in float viewDotInvSqrt, in float metallic, in float smoothness, in bool realSky){
+    return complexShadingDeferred(sceneCol, screenPos, viewPos, normal, albedo, dither, viewDotInvSqrt, metallic, smoothness, 0.0, realSky);
+}
+
+// Cel shading for deferred lighting - unique name to avoid conflicts
+float cartoon_celShadeLighting(float NdotL, int steps) {
+    #ifdef CARTON_STYLE_ENABLED
+        float s = float(steps);
+        float x = clamp(NdotL, 0.0, 1.0) * s;
+        float band = floor(x);
+        float frac = x - band;
+        float knee = float(CEL_THRESHOLD) * 0.006;
+        float t = smoothstep(0.0, knee, frac) * smoothstep(knee * 2.0, knee, frac);
+        return (band + t) / s + (frac / s) * 0.25;
+    #else
+        return NdotL;
+    #endif
+}
+
+// Then inside the main complexShadingDeferred function, find where lighting is calculated
+// and modify to use cel shading. Add this after the existing lighting calculations:
+
+// Reflection blur helper: multi-tap Poisson/Gaussian style sampling for high-quality
+// screen-space reflection blurring. Use `colortex4` (current frame) or `colortex5`
+// (previous frame) as the `sceneTex` argument.
+const vec2 reflectionPoissonDisk[8] = vec2[8](
+    vec2(-0.94201624, -0.39906216),
+    vec2(0.94558609, -0.76890725),
+    vec2(-0.094184101, -0.92938870),
+    vec2(0.34495938, 0.29387760),
+    vec2(-0.91588581, 0.45771432),
+    vec2(-0.81544232, -0.87912464),
+    vec2(-0.38277543, 0.27676845),
+    vec2(0.97484398, 0.75648379)
+);
+
+vec3 sampleReflectionBlur(sampler2D sceneTex, vec2 uv, float roughness){
+    // roughness: 0.0 = perfectly smooth (sharp), 1.0 = very rough (max blur)
+    float r = clamp(roughness, 0.0, 1.0);
+
+    // Even very small roughness should produce a visible blur at high resolutions,
+    // so enforce a small minimum effective roughness.
+    float minBlur = 0.08; // tune this to control minimum blur strength
+    float effR = max(r, minBlur);
+
+    // Radius in pixels (tunable): small for subtle blur, larger for rough surfaces
+    float maxRadius = 12.0; // increased for more visible blur on large displays
+    float radius = mix(2.0, maxRadius, pow(effR, 0.75));
+
+    // Weigh center modestly to allow blur to show; distribute remainder across taps
+    float wCenter = 0.22;
+    float wSide = (1.0 - wCenter) / 8.0;
+
+    vec3 col = texture(sceneTex, uv).rgb * wCenter;
+    for(int i = 0; i < 8; ++i){
+        // Convert pixel offset to UV offset using view dimensions for consistent scaling
+        vec2 off = reflectionPoissonDisk[i] * radius / vec2(viewWidth, viewHeight);
+        col += texture(sceneTex, uv + off).rgb * wSide;
+    }
+
+    return col;
+}
+
+// Screen-space reflection occlusion test: march along the reflected view
+// direction in view-space, project samples to screen and compare against the
+// depth buffer. If an occluder is found between the surface and the sky along
+// the reflected ray, consider the sky occluded.
+// Guarded by `USE_REFLECTION_OCCLUSION` so it's optional and drop-in safe.
+#ifdef USE_REFLECTION_OCCLUSION
+bool isReflectionSkyOccluded(in vec3 startViewPos, in vec3 dir){
+    vec3 d = normalize(dir);
+    // How far to march (tunable). Use borderFar which is used elsewhere.
+    float maxDist = borderFar;
+    // Number of steps (tunable): 6..12 is a good compromise.
+    const int STEPS = 8;
+    float step = maxDist / float(STEPS);
+    for(int i = 1; i <= STEPS; ++i){
+        float dist = step * float(i);
+        vec3 samplePos = startViewPos + d * dist;
+        vec3 sp = getScreenPos(gbufferProjection, samplePos);
+        if(sp.x < 0.0 || sp.x > 1.0 || sp.y < 0.0 || sp.y > 1.0) continue;
+        float sceneD = getDepthTex(sp.xy);
+        // sp.z is the view-space depth projected; compare with scene depth.
+        // small epsilon to avoid self-intersection
+        if(sceneD < sp.z - 0.002) return true;
+    }
+    return false;
+}
+#endif
+
+// `puddleBlend` is passed via the G-buffer material.z channel (0..1).
+// When >0 it indicates puddle/ripple strength; we warp reflection sampling accordingly.
+vec3 complexShadingDeferred(in vec3 sceneCol, in vec3 screenPos, in vec3 viewPos, in vec3 normal, in vec3 albedo, in vec3 dither, in float viewDotInvSqrt, in float metallic, in float smoothness, in float puddleBlend, in bool realSky){
+    vec3 noiseUnitVector = generateUnitVector(dither.xy);
+
+    // ── Screen-Space Global Illumination (SSGI) ─────────────────────────────
+    // Original ray-traced global illumination using screen-space ray marching.
+    // Traces cosine-distributed rays from the surface to find indirect lighting.
+    #ifdef SSGI
+    {
+        // Get SSGI screen coordinates
+        vec3 SSGIcoord = rayTraceScene(screenPos, viewPos, generateCosineVector(normal, noiseUnitVector), dither.z);
+
+        // If sky don't do SSGI
+        #ifdef PREVIOUS_FRAME
+            if(SSGIcoord.z > 0.5) sceneCol += albedo * textureLod(colortex5, getPrevScreenCoord(SSGIcoord.xy), 0).rgb;
+        #else
+            if(SSGIcoord.z > 0.5) sceneCol += albedo * textureLod(colortex4, SSGIcoord.xy, 0).rgb;
+        #endif
+    }
+    #endif
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // If smoothness is 0, return immediately
+    if(smoothness < 0.005) return sceneCol;
+
+    #ifdef ROUGH_REFLECTIONS
+        // Rough the normals with noise
+        normal = generateCosineVector(normal, noiseUnitVector * (squared(1.0 - smoothness) * 0.5));
+    #endif
+
+    vec3 nViewPos = viewPos * viewDotInvSqrt;
+
+    // Get reflected view direction
+    // reflect(direction, normal) = direction - 2.0 * dot(normal, direction) * normal
+    float NV = dot(normal, -nViewPos);
+    vec3 reflectViewDir = nViewPos + (2.0 * NV) * normal;
+
+    
+
+    // Calculate SSR and sky reflections
+    // Prepare reflection color and flag whether it comes from the sky
+    vec3 reflectCol = vec3(0.0);
+    bool reflectIsSky = false;
+
+    // Optional: sun / shadow visibility test. If you enable `USE_SUN_SHADOW_TEST`
+    // and provide the uniforms below, the shader will reduce/disable sun
+    // highlights when the surface is shadowed from the sun (prevents bright
+    // sun/moon glints on water when the point is in shadow).
+    // Required uniforms when enabled:
+    //  - uniform mat4 viewToWorld;        // converts view-space pos -> world-space
+    //  - uniform mat4 shadowMatrix;      // light projection matrix for shadow map
+    //  - uniform sampler2DShadow shadowMap;
+    //  - uniform vec3 sunDirectionWorld; // normalized sun direction in world space
+    #ifdef USE_SUN_SHADOW_TEST
+        vec3 worldPos = (viewToWorld * vec4(viewPos, 1.0)).xyz;
+        vec4 shadowCoord = shadowMatrix * vec4(worldPos, 1.0);
+        shadowCoord /= shadowCoord.w;
+        float sunVisibility = 1.0;
+        // Sample shadow map if inside light frustum
+        if(shadowCoord.x >= 0.0 && shadowCoord.x <= 1.0 && shadowCoord.y >= 0.0 && shadowCoord.y <= 1.0){
+            sunVisibility = texture(shadowMap, shadowCoord.xyz);
+        }
+    #endif
+
+    // Optional: lightmap-based sky visibility test. If `USE_LIGHTMAP` is
+    // defined, the shader will sample a `lightmap` texture (screen-space or
+    // packed light texture provided by the engine) at `screenPos.xy` and use
+    // it to attenuate sky/sun reflections when the surface is shadowed.
+    // Provide a `uniform sampler2D lightmap;` from the renderer when enabling.
+    #ifdef USE_LIGHTMAP
+        float lightmapVis = texture(lightmap, screenPos.xy).r;
+        // remap/gamma (if your lightmap is HDR or encoded, adjust accordingly)
+        lightmapVis = pow(lightmapVis, 1.0);
+    #endif
+
+    #ifdef SSR
+        // Get SSR screen coordinates
+        vec3 SSRCoord = rayTraceScene(screenPos, viewPos, reflectViewDir, dither.z);
+
+        // Fake reflections, also helps with improving reflection quality
+        if(SSRCoord.z < 0.5){
+            // Using the original ray direction, get the reflected ray and increase its length
+            vec3 reflectDirF = viewPos + reflectViewDir * borderFar;
+
+            // This masks only the reflections in view
+            if(reflectDirF.z < viewPos.z){
+                vec3 SSRDH = getScreenPos(gbufferProjection, reflectDirF);
+                // SSRDH.xy *= vec2(viewWidth, viewHeight);
+                if(SSRDH.x >= 0 && SSRDH.y >= 0 && SSRDH.x <= 1 && SSRDH.y <= 1 && getDepthTex(SSRDH.xy) != 1) SSRCoord = vec3(SSRDH.xy * vec2(viewWidth, viewHeight), 1);
+            }
+        }
+
+        // Get reflections and check for sky; apply blur based on roughness
+        if(SSRCoord.z < 0.5){
+            // SSR returned no hit (likely sky). Use sky reflection when the
+            // reflected ray points upward toward the sky.
+            // Note: don't gate on `realSky` here — DH water sets realSky=true
+            // but is still a surface that should get SSR/scene reflections.
+            vec3 reflDirN = normalize(reflectViewDir);
+            bool reflLooksUp = reflDirN.y > -0.5;
+            if(reflLooksUp){
+                // Get the sky/cubemap sample for this reflected direction
+                vec3 skySample = getSkyReflection(reflDirN);
+
+#ifdef USE_REFLECTION_OCCLUSION
+                // If a nearby occluder exists along the reflected ray, treat
+                // the sky as occluded for this reflection.
+                bool occ = isReflectionSkyOccluded(viewPos, reflectViewDir);
+                if(occ){
+                    skySample = vec3(0.0);
+                }
+#endif
+
+                #ifdef USE_SUN_SHADOW_TEST
+                    // If the reflected direction points near the sun, attenuate
+                    // the bright glint if the point is in shadow relative to the sun.
+                    float sunAlign = max(0.0, dot(reflDirN, normalize(sunDirectionWorld)));
+                    // Threshold to consider this reflection as a sun glint
+                    if(sunAlign > 0.96){
+                        skySample *= sunVisibility; // 0 = fully shadowed, 1 = lit
+                    }
+                #endif
+
+
+
+                reflectCol = skySample;
+                reflectIsSky = true;
+            } else {
+                reflectCol = vec3(0.0);
+                reflectIsSky = false;
+            }
+        } else {
+            #ifdef PREVIOUS_FRAME
+                ivec2 prevPix = ivec2(getPrevScreenCoord(SSRCoord.xy * vec2(pixelWidth, pixelHeight)) * vec2(viewWidth, viewHeight));
+                vec2 texUV = (vec2(prevPix) + 0.5) / vec2(viewWidth, viewHeight);
+                reflectCol = sampleReflectionBlur(colortex5, texUV, 1.0 - smoothness);
+            #else
+                vec2 texUV = SSRCoord.xy / vec2(viewWidth, viewHeight);
+                reflectCol = sampleReflectionBlur(colortex4, texUV, 1.0 - smoothness);
+            #endif
+            reflectIsSky = false;
+        }
+    #else
+        // Non-SSR path: fall back to sky only when the current view actually
+        // sees the sky (best-effort). Ensure `reflectCol` is already declared.
+        if(!realSky){
+            reflectCol = vec3(0.0);
+            reflectIsSky = false;
+        } else {
+            reflectCol = getSkyReflection(reflectViewDir);
+            reflectIsSky = true;
+        }
+    #endif
+
+    // If this pixel has puddle ripples, apply a small animated screen-space warp to reflection sampling
+    if(puddleBlend > 0.01){
+        vec2 uv = screenPos.xy;
+        float t = fragmentFrameTime;
+        // direction + noise-based magnitude for organic motion
+        vec2 rippleDir = vec2(sin(uv.x * 120.0 + t * 4.0), cos(uv.y * 120.0 + t * 3.5));
+        float n = texture(noisetex, uv * 4.0 + t * 0.05).x * 2.0 - 1.0;
+        float mag = clamp(puddleBlend * 0.035 * (0.5 + 0.5 * n), 0.0, 0.09);
+        vec2 sampleUV = uv + rippleDir * mag;
+        if(reflectIsSky){
+            // For sky reflections, perturb the reflection direction and sample the sky.
+            vec3 pert = normalize(reflectViewDir + vec3(rippleDir * mag * 0.5, mag * 0.08));
+            reflectCol = getSkyReflection(pert);
+        } else {
+            // Sample the scene buffer using the high-quality blur helper to get a warped reflection color
+            reflectCol = sampleReflectionBlur(colortex4, sampleUV, 1.0 - smoothness);
+        }
+    }
+
+    // Modified version of BSL's reflection PBR calculation
+    // vec3 fresnel = (F0 + (1.0 - F0) * cosTheta) * smoothness
+    // Fresnel calculation derived and optimized from this equation
+    float smoothCosTheta = NV > 0 ? exp2(-9.28 * NV) * smoothness : smoothness;
+    float oneMinusCosTheta = smoothness - smoothCosTheta;
+
+    if(metallic <= 0.9) return sceneCol + reflectCol * (smoothCosTheta + metallic * oneMinusCosTheta);
+    return sceneCol + reflectCol * (smoothCosTheta + albedo * oneMinusCosTheta);
+}

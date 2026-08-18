@@ -1,0 +1,516 @@
+const uint volumetricCloudSteps = uint(VOLUMETRIC_CLOUD_STEPS);
+const float volumetricCenterDepth = 0.0 * 0.5;
+const float volumetricCloudHeight = 2048.0;
+
+// ShaderToy-like lighting/shape tuning constants
+const float VC_TRANSMISSION_FACTOR = 0.35;
+const float VC_ABSORPTION_FACTOR = 0.45;
+const float VC_DENSITY_DISTANCE_SCALE = 10.0;
+const float VC_CLOUD_DENSITY_SCALE = 0.10;
+const float VC_CLOUD_OPACITY_SCALE = 1.75;
+const float VC_EDGE_HIGHLIGHT_FACTOR = 1.5;
+const float VC_AMBIENT_INTENSITY = 1.22;
+const float VC_SUN_INTENSITY = 1.2;
+const float VC_CLOUD_HEIGHT_REFERENCE = 4096.0;
+const float VC_CLOUD_HEIGHT_SCALE_MAX = 8.0;
+const float VC_CLOUD_HEIGHT_SCALE_MIN = 0.25;
+// Time-driven animation knobs
+const float VC_SHAPE_TIME_SCALE = 0.45;
+const float VC_BULGE_TIME_SCALE = 0.9;
+const float VC_SHAPE_AMPLITUDE = 0.12;
+const float VC_BULGE_AMPLITUDE = 0.06;
+
+// ============================================================================
+// Volumetric Clouds — TRUE 3D raymarch
+//
+// Lighting is now fully aligned with the skyRender.glsl cloud lighting model
+// (getSkyClouds): three-zone TOP/MID/BOTTOM shading, Beer-Lambert optical
+// depth self-shadow, AO, silver-lining, undersideColor.
+//
+// MIXED MODE: when CLOUD_TYPE == 2 the skybox 2D cumulus layer (getSkyClouds)
+// is ALSO rendered on top of the volumetric result for sky pixels, giving you
+// both layers simultaneously with correct blending.
+// ============================================================================
+
+uniform sampler2D cloudnoise;
+
+float cloudPhaseFunction(float cosAngle, float g) {
+    float g2 = g * g;
+    return (1.0 - g2) / (4.0 * 3.14159 * pow(1.0 + g2 - 2.0 * g * cosAngle, 1.5)) * 1.5;
+}
+
+float GetCloud2DNoise(in vec2 uv) {
+    vec2 fuv = fract(uv);
+    return texture2D(cloudnoise, fuv).x;
+}
+
+float GetCloud3DNoise(in vec3 pos) {
+    vec2 uv = fract(pos.xy * vec2(0.021, 0.017) + vec2(0.13, 0.42));
+    float zBlend = fract(pos.z * 0.09);
+
+    float n0 = texture2D(cloudnoise, uv + vec2(0.17, 0.31)).x;
+    float n1 = texture2D(cloudnoise, uv + vec2(0.53, 0.14)).x;
+    float n2 = texture2D(cloudnoise, uv + vec2(0.29, 0.79)).x;
+    float n3 = texture2D(cloudnoise, uv + vec2(0.84, 0.61)).x;
+
+    float n01 = mix(n0, n1, fract(zBlend * 1.7));
+    float n23 = mix(n2, n3, fract(zBlend * 2.2));
+    return mix(n01, n23, smoothstep(0.0, 1.0, zBlend));
+}
+
+// ── Cloud slab bounds ─────────────────────────────────────────────────────────
+#define VC_SLAB_MULT 6.0
+
+// ── Domain warp ───────────────────────────────────────────────────────────────
+float _vc_cloudSizeScale() {
+    return clamp(VC_CLOUD_HEIGHT_REFERENCE / volumetricCloudHeight,
+                 VC_CLOUD_HEIGHT_SCALE_MIN,
+                 VC_CLOUD_HEIGHT_SCALE_MAX);
+}
+
+vec2 _vc_warp(vec2 xz, float t) {
+    vec2 uv0 = xz * 0.0008 + vec2(t * 0.008, 0.0);
+    vec2 uv1 = xz * 0.0008 + vec2(0.0, t * 0.006) + vec2(1.7, 9.2);
+    float wx = texture2D(cloudnoise, uv0 / 64.0).x - 0.5;
+    float wz = texture2D(cloudnoise, uv1 / 64.0).x - 0.5;
+    return vec2(wx, wz) * 200.0;
+}
+
+// ── True 3D cumulus density ───────────────────────────────────────────────────
+float _vc_density3D(vec3 worldPos, float h, float t) {
+    float cloudSizeScale = _vc_cloudSizeScale();
+    float slabH = max(VOLUMETRIC_CLOUD_DEPTH * VC_SLAB_MULT, 1.0);
+    float yMult = 500.0 / slabH;
+
+    vec2 scaledXZ = worldPos.xz * cloudSizeScale;
+    vec2 warpedXZ = scaledXZ + _vc_warp(scaledXZ, t);
+    vec3 wind = vec3(t * 0.028, 0.0, t * 0.021);
+    vec3 timeOffset = vec3(sin(t * 0.21) * 12.0, cos(t * 0.19) * 6.0, sin(t * 0.17) * 9.0);
+
+    vec3 pCover = vec3(warpedXZ * 0.00065, worldPos.y * 0.00065 * yMult) + wind * 0.08 + vec3(4.2, 1.7, 9.1);
+    float cover = GetCloud3DNoise(pCover);
+    cover = smoothstep(0.28, 0.80, cover);
+
+    vec3 pC = vec3(warpedXZ * 0.0019, worldPos.y * 0.0019 * yMult) + wind * 0.35 + timeOffset * 0.8;
+    vec3 pM = vec3(warpedXZ * 0.0055, worldPos.y * 0.0055 * yMult) + wind * 0.95 + vec3(3.7, 1.1, 2.3) + timeOffset * 1.4;
+    vec3 pF = vec3(warpedXZ * 0.0144, worldPos.y * 0.0144 * yMult) + wind * 1.5 + vec3(7.3, 5.2, 8.1) + timeOffset * 2.5;
+
+    float coarse = GetCloud3DNoise(pC);
+    float mid    = GetCloud3DNoise(pM);
+    float fine   = GetCloud3DNoise(pF);
+
+    vec3 pC_off1 = vec3((warpedXZ + vec2(68.0, 0.0)) * 0.0019, worldPos.y * 0.0019 * yMult) + wind * 0.35;
+    vec3 pC_off2 = vec3((warpedXZ + vec2(0.0, 68.0)) * 0.0019, worldPos.y * 0.0019 * yMult) + wind * 0.35;
+    float coarseBlur = (coarse + GetCloud3DNoise(pC_off1) + GetCloud3DNoise(pC_off2)) * 0.3333;
+
+    vec3 pMacro = vec3(warpedXZ * 0.00078, worldPos.y * 0.00078 * yMult) + wind * 0.06 + vec3(9.2, 4.3, 6.9);
+    float macro = GetCloud3DNoise(pMacro);
+    float macroSmooth = smoothstep(0.26, 0.72, macro);
+
+    float baseShape = coarseBlur * 0.60 + mid * 0.30 + fine * 0.10;
+    baseShape = mix(baseShape, macroSmooth, 0.30);
+    baseShape *= (1.0 + VC_SHAPE_AMPLITUDE * sin(t * VC_SHAPE_TIME_SCALE + coarse * 6.2831853));
+    baseShape = smoothstep(0.24, 0.86, baseShape);
+    baseShape *= cover;
+
+    float heightNoise = clamp(coarseBlur * 0.55 + macro * 0.45, 0.0, 1.0);
+    float localHeight = clamp((h - 0.02) * mix(0.9, 2.0, heightNoise), 0.0, 1.0);
+
+    float baseV = smoothstep(0.04, 0.18, localHeight);
+    float topV  = 1.0 - smoothstep(0.72, 0.96, localHeight);
+    float dome  = exp(-pow((localHeight - 0.58) * 3.2, 2.0));
+    float profile = clamp(baseV * topV + dome * 0.8, 0.0, 1.0);
+
+    float verticalNoise = GetCloud3DNoise(vec3(warpedXZ * 0.020, worldPos.y * 0.085 * yMult) + wind * 2.2);
+    float vMask = smoothstep(0.18, 0.82, verticalNoise);
+    profile *= mix(1.0, 0.88, vMask * 0.45);
+
+    float bulgeNoise = GetCloud3DNoise(vec3(warpedXZ * 0.013, worldPos.y * 0.046 * yMult) + wind * 1.7 + vec3(8.1, 2.4, 3.6));
+    float bulgeOffset = (bulgeNoise - 0.5) * 0.18;
+    bulgeOffset += sin(t * VC_BULGE_TIME_SCALE + warpedXZ.x * 0.002 + warpedXZ.y * 0.001) * VC_BULGE_AMPLITUDE;
+
+    float lowerBulge = exp(-pow((localHeight - (0.24 + bulgeOffset)) * 3.2, 2.0)) * 0.65;
+    float upperBulge = exp(-pow((localHeight - (0.78 + bulgeOffset * 0.7)) * 4.8, 2.0)) * 0.95;
+    profile = max(profile, mix(lowerBulge, upperBulge, localHeight));
+
+    float density = clamp(baseShape * profile, 0.0, 1.0);
+    float edgeFactor = smoothstep(0.08, 0.56, baseShape * coarseBlur);
+    density = mix(density * 0.55, density, edgeFactor);
+
+    float topErode = GetCloud3DNoise(vec3(warpedXZ * 0.019, worldPos.y * 0.019 * yMult) + wind * 1.9 + vec3(5.5, 2.2, 11.0));
+    density -= topErode * 0.12 * smoothstep(0.36, 1.0, h);
+    density *= VC_CLOUD_DENSITY_SCALE;
+
+    return clamp(density, 0.0, 1.0);
+}
+
+float beerPowder(float d) {
+    return 1.0 - exp(-d);
+}
+
+// ============================================================================
+// SKY-RENDER LIGHTING MODEL — ported from getSkyClouds() in skyRender.glsl
+//
+// Computes per-sample cloud color using the same three-zone TOP/MID/BOTTOM
+// shading, Beer-Lambert optical depth self-shadow, silver lining, and AO that
+// the skybox 2D cloud layer uses. This ensures consistent look between the two
+// modes when mixing.
+//
+// Parameters:
+//   rayPos        — world-space sample point (player-relative metres)
+//   h             — normalised height in slab [0=bottom, 1=top]
+//   dens          — local cloud density at this sample
+//   ds            — integrated density toward the sun (pre-computed upstream)
+//   viewDir       — normalised view direction
+//   sunDir        — normalised sun direction
+//   sunHeight     — sunDir.y (clamped ≥ 0.01 upstream)
+//   lowSunFactor  — clamp(1 - sunHeight*1.4, 0, 1)
+//   sunViewDot    — dot(viewDir, sunDir)
+//   sunGlowFactor — sunViewDot^2 * dayCycle
+//   sunProximity  — sunViewDot^3
+//   antiSunFactor — 1 - sunViewDot
+//   directSunColor, atmosAmbient, atmosHorizSun, atmosHorizAnti, atmosDown
+//                 — atmosphere colour terms, must be computed once per ray
+// ============================================================================
+vec3 vc_skyRenderLighting(
+    vec3  rayPos,
+    float h,
+    float dens,
+    float ds,
+    vec3  viewDir,
+    vec3  sunDir,
+    float sunHeight,
+    float lowSunFactor,
+    float sunViewDot,
+    float sunGlowFactor,
+    float sunProximity,
+    float antiSunFactor,
+    vec3  directSunColor,
+    vec3  atmosAmbient,
+    vec3  atmosHorizSun,
+    vec3  atmosHorizAnti,
+    vec3  atmosDown,
+    float t3D)
+{
+    // ── Beer-Lambert self-shadow toward sun ───────────────────────────────────
+    // ds is the integrated optical depth toward the sun (passed in from raymarch).
+    // We compute the transmittance exactly as getSkyClouds does.
+    float sunAngleFactor = clamp(sunDir.y, 0.0, 1.0);
+    float shadowBoost    = mix(1.6, 1.0, sunAngleFactor); // stronger shadows at low sun
+    float beerShadow     = exp(-ds * 1.25 * shadowBoost);
+
+    // ── Ambient occlusion (density drives interior darkening) ─────────────────
+    float ao = 1.0 - clamp(dens * 0.85, 0.0, 0.78);
+
+    // ── Silver lining + sun burst (from getSkyClouds) ─────────────────────────
+    float sv4         = sunViewDot * sunViewDot * sunViewDot * sunViewDot;
+    float silverLining = sv4 * smoothstep(0.0, 0.4, sunHeight);
+    float sunBurst     = sv4 * sv4 * lowSunFactor * dayCycle;
+
+    // ── TOP LAYER — sunlit cauliflower tops ───────────────────────────────────
+    vec3 topSunlit = directSunColor * (1.0 + silverLining * 3.5 + sunBurst * 5.0);
+         topSunlit *= beerShadow * ao;
+         topSunlit *= mix(1.0, 1.4, smoothstep(0.6, 0.1, dens)); // wispy edge catch
+
+    // ── MID LAYER — body shading ──────────────────────────────────────────────
+    vec3 scatterShade  = mix(atmosHorizAnti * 0.5, atmosHorizSun * 0.35, sunGlowFactor * 0.5);
+         scatterShade  = mix(scatterShade, vec3(0.04, 0.05, 0.08), 0.3);
+    float NdotL         = clamp(sunDir.y * 0.5 + 0.5, 0.0, 1.0);
+    float shadowDepth   = clamp((1.0 - beerShadow) + (1.0 - NdotL) * 0.5, 0.0, 1.0);
+    vec3  midCloudColor = mix(scatterShade * 0.75, vec3(0.04, 0.05, 0.08), shadowDepth * 0.45);
+          midCloudColor *= ao;
+
+    // ── BOTTOM LAYER — flat shadowed underside ────────────────────────────────
+    vec3 undersideBase  = mix(atmosHorizAnti * 0.22, atmosDown * 0.35, 0.55);
+         undersideBase  = mix(undersideBase, atmosHorizSun * 0.10, sunProximity * lowSunFactor * 0.40);
+    vec3 undersideColor = mix(undersideBase, vec3(0.012, 0.016, 0.030), 0.68);
+         undersideColor *= ao * 0.52; // dark AO for realistic shadowed underside
+
+    // ── Height-based blend weights (mirroring getSkyClouds layer accumulation) ─
+    // h is the normalised height in the slab; here we derive top/bottom weights
+    // per-sample (a point high in the slab contributes topWeight, low → bottom).
+    float topWeight    = h;                   // 0 at base, 1 at top
+    float bottomWeight = 1.0 - h;            // 1 at base, 0 at top
+
+    // view-facing bottom mask (only show underside when looking up)
+    float viewUpFactor  = clamp(viewDir.y * 1.6 + 0.05, 0.0, 1.0);
+    float undersideMix  = clamp(bottomWeight * 1.6 * viewUpFactor, 0.0, 1.0);
+
+    // ── Blend three zones ─────────────────────────────────────────────────────
+    vec3 directCloud = mix(midCloudColor, topSunlit,    clamp(topWeight    * 1.3, 0.0, 1.0));
+         directCloud = mix(directCloud,   undersideColor, undersideMix * 0.88);
+
+    // ── Ambient fill (sky ambient, sun proximity fill, horizon fill) ──────────
+    float nightAmbientFactor = mix(0.05, 1.0, dayCycle);
+    float upDot = clamp(viewDir.y, 0.0, 1.0);
+    vec3 cloudAmbient  = atmosAmbient * 0.24 * nightAmbientFactor * upDot;
+         cloudAmbient += atmosHorizSun * 0.17 * sunProximity * lowSunFactor * dayCycle * upDot;
+         cloudAmbient += atmosDown * 0.06 * upDot;
+
+    // ── Phase function — forward scattering tint ──────────────────────────────
+    float phase = cloudPhaseFunction(clamp(dot(viewDir, sunDir), -1.0, 1.0), 0.65);
+    // Blend phase-derived brightening onto the direct channel (matches old VC behaviour)
+    directCloud *= (0.85 + 0.35 * phase);
+
+    // ── Per-sample sunglow detail noise ───────────────────────────────────────
+    float sundiff = GetCloud3DNoise(vec3(rayPos.xz * 0.002 + vec2(t3D * 0.03, 0.0), rayPos.y * 0.001));
+    float directLightFalloff = clamp(0.55 + sundiff * 0.9 + sunGlowFactor * 0.9, 0.0, 1.6);
+    directCloud *= mix(0.75, 1.0, directLightFalloff);
+
+    return (directCloud + cloudAmbient);
+}
+
+// ── 2D base haze (kept for compatibility, disabled by default) ─────────────────
+float sampleCloudDensity(vec3 pos, float time) {
+    float density = 0., amp = 2., freq = 0.1, maxA = 0.;
+    vec2 wind = vec2(sin(time * 0.015), cos(time * 0.012)) * time * 0.08;
+    for (int i = 0; i < 5; i++) {
+        float s = fbm2((pos.xz + wind) * freq * 0.04);
+        if (i == 0) s = pow(s, 1.1);
+        s *= smoothstep(-60., 60., pos.y);
+        density += s * amp; maxA += amp; amp *= 0.; freq *= 2.1;
+    }
+    return density / maxA;
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+vec4 volumetricClouds(in vec3 nFeetPlayerPos, in vec3 cameraPos,
+                      in float feetPlayerDist, in float dither, in bool isSky)
+{
+    // Slab bounds
+    float slabTop    = 0.0;
+    float slabBottom = -VOLUMETRIC_CLOUD_DEPTH * VC_SLAB_MULT;
+
+    float cloudFar = isSky ? 99999.0 : min(99999.0, feetPlayerDist * 0.95);
+    float lowerB   = (slabBottom - cameraPos.y) / nFeetPlayerPos.y;
+    float higherB  = (slabTop    - cameraPos.y) / nFeetPlayerPos.y;
+    float nearP    = max(min(lowerB, higherB), 0.0);
+    float farP     = min(cloudFar, max(lowerB, higherB));
+    if (farP <= nearP) return vec4(0.0);
+
+    float dist  = farP - nearP;
+    uint  steps = min(uint(dist * 0.00006), volumetricCloudSteps);
+    steps = max(steps, 6u);
+
+    vec3 stepVec = nFeetPlayerPos * (dist / float(steps));
+    vec3 rayPos  = cameraPos + nFeetPlayerPos * nearP + stepVec * dither;
+
+    float slabRange = slabTop - slabBottom;
+
+    vec3 viewDir = normalize(nFeetPlayerPos);
+
+    vec3 sunDir = normalize(transpose(mat3(shadowModelView)) * vec3(0., 0., 1.));
+    #ifndef FORCE_DISABLE_DAY_CYCLE
+        if (dayCycle < 1.0) sunDir = -sunDir;
+    #endif
+
+    float t3D = fragmentFrameTime * 0.18;
+
+    // ── Pre-compute atmospheric colour terms (shared with skyRender model) ────
+    float sunHeight     = max(0.01, sunDir.y);
+    float lowSunFactor  = clamp(1.0 - sunHeight * 1.4, 0.0, 1.0);
+    float sunViewDot    = clamp(dot(normalize(nFeetPlayerPos), sunDir), 0.0, 1.0);
+    float sunProximity  = sunViewDot * sunViewDot * sunViewDot;
+    float sunGlowFactor = sunViewDot * sunViewDot * dayCycle;
+    float antiSunFactor = clamp(1.0 - sunViewDot, 0.0, 1.0);
+
+    vec3 horizSunDir    = normalize(vec3(sunDir.x, 0.02, sunDir.z));
+    vec3 atmosHorizSun  = clamp(seusAtmosphere(horizSunDir, sunDir), vec3(0.0), vec3(6.0));
+    vec3 atmosUp        = clamp(seusAtmosphere(vec3(0.0, 1.0, 0.0), sunDir), vec3(0.0), vec3(4.0));
+    vec3 atmosHorizAnti = mix(atmosHorizSun * 0.5, atmosUp * 0.4, 0.7);
+    vec3 atmosDown      = mix(atmosHorizSun * 0.3, vec3(0.05, 0.06, 0.1), 0.6);
+    vec3 atmosViewDir   = mix(atmosUp, atmosHorizSun, sunGlowFactor * 0.65);
+    float antiSqrd      = antiSunFactor * antiSunFactor;
+    vec3 atmosAmbient   = mix(atmosViewDir, atmosHorizAnti * 0.7, antiSqrd * antiSunFactor * 0.4);
+
+    #ifdef FORCE_DISABLE_DAY_CYCLE
+        vec3 directSunColor = lightCol * 2.2;
+    #else
+        vec3 directSunColor = mix(moonCol * 0.8,
+                                  mix(sunCol * 2.0, atmosHorizSun * 1.6,
+                                      lowSunFactor * 0.5 + sunProximity * 0.3),
+                                  dayCycleAdjust);
+    #endif
+    directSunColor = mix(directSunColor, directSunColor * vec3(1.35, 0.95, 0.6), lowSunFactor * 0.6);
+
+    float nightDim = mix(0.08, 1.0, dayCycle);
+
+    vec3  accumColor = vec3(0.0);
+    float accumAlpha = 0.0;
+    float trans      = 1.0;
+
+    // ── Raymarch ──────────────────────────────────────────────────────────────
+    for (uint i = 0u; i < steps; ++i) {
+        float rDist = length(rayPos - cameraPos);
+        if (rDist > cloudFar) break;
+
+        float distanceFade = 1.0 - smoothstep(cloudFar * 0.65, cloudFar, rDist);
+        float h = clamp((rayPos.y - slabBottom) / slabRange, 0.0, 1.0);
+
+        float dens = _vc_density3D(rayPos, h, t3D);
+        #ifndef FORCE_DISABLE_WEATHER
+            dens = clamp(dens + rainStrength * 0.55, 0.0, 1.0);
+        #endif
+        dens = clamp(dens * CLOUD_FILL * VC_CLOUD_DENSITY_SCALE, 0.0, 1.0) * distanceFade;
+
+        float stepLen = length(stepVec);
+
+        if (dens > 0.0001) {
+            // ── Integrated optical depth toward sun (Beer-Lambert, 5 weighted samples) ─
+            // Matches the sampling strategy used in the old code but feeds into
+            // the skyRender lighting model via beerShadow = exp(-ds * 1.25 * shadowBoost).
+            float weights[5];
+            weights[0] = 0.42; weights[1] = 0.28; weights[2] = 0.16;
+            weights[3] = 0.08; weights[4] = 0.06;
+            float offsets[5];
+            offsets[0] = slabRange * 0.02;
+            offsets[1] = slabRange * 0.06;
+            offsets[2] = slabRange * 0.12;
+            offsets[3] = slabRange * 0.25;
+            offsets[4] = slabRange * 0.45;
+
+            float ds = dens * 1.0; // start with local density
+            for (int s = 0; s < 5; ++s) {
+                vec3  sp = rayPos + sunDir * offsets[s];
+                float sh = clamp((sp.y - slabBottom) / slabRange, 0.0, 1.0);
+                float sd = _vc_density3D(sp, sh, t3D);
+                sd = clamp(sd * CLOUD_FILL * VC_CLOUD_DENSITY_SCALE, 0.0, 1.0);
+                ds += sd * weights[s];
+            }
+
+            // ── Three-zone cloud colour from skyRender lighting model ─────────
+            vec3 sampleCol = vc_skyRenderLighting(
+                rayPos, h, dens, ds,
+                viewDir, sunDir,
+                sunHeight, lowSunFactor,
+                sunViewDot, sunGlowFactor, sunProximity, antiSunFactor,
+                directSunColor, atmosAmbient,
+                atmosHorizSun, atmosHorizAnti, atmosDown,
+                t3D);
+
+            // ── Interior high-frequency detail ────────────────────────────────
+            if (dens > 0.10) {
+                float small = texture2D(cloudnoise, rayPos.xz * 0.03 + vec2(t3D * 0.02, 0.0)).r;
+                dens = max(0.0, dens - pow(small, 3.0) * 0.7);
+                float vSt  = GetCloud3DNoise(vec3(rayPos.xz * 0.016, rayPos.y * 0.07));
+                float vMod = smoothstep(0.25, 0.85, vSt * 0.5 + 0.5);
+                dens      *= mix(1.0, 0.78, vMod * 0.7);
+                sampleCol *= mix(1.0, 0.75, vMod * 0.6);
+            }
+
+            // ── Alpha accumulation (Beer-Lambert front-to-back) ───────────────
+            float alphaMul = 1.2 + 0.8 * clamp(dens * 2.0, 0.0, 1.0);
+            float alpha    = 1.0 - exp(-dens * stepLen * alphaMul * VC_CLOUD_OPACITY_SCALE);
+            alpha = clamp(alpha, 0.0, 1.0);
+
+            accumColor += sampleCol * alpha * trans;
+            trans      *= (1.0 - alpha);
+            accumAlpha  = 1.0 - trans;
+
+            if (trans < 0.02) break;
+        }
+
+        rayPos += stepVec;
+    }
+
+    // Apply night dimming
+    accumColor *= nightDim;
+
+    // ── MIXED MODE DISABLED ───────────────────────────────────────────────────
+    // The skybox 2D cumulus layer is not composited on top of the volumetric
+    // result when displaying volumetric clouds.
+
+
+    return vec4(accumColor, accumAlpha);
+}
+
+// ============================================================================
+// VOLUMETRIC CLOUD SHADOW — Cast accurate cloud shadows on terrain
+// ============================================================================
+// Traces a ray from a given world position toward the sun direction through
+// the volumetric cloud slab, computing shadow transmittance (0=fully shadowed,
+// 1=no shadow). Returns the light transmittance multiplier for sun lighting.
+//
+// Parameters:
+//   worldPos      — world-space position (player-relative) on terrain
+//   sunDir        — normalised sun direction
+//   cameraPos     — camera position (player-relative)
+//   slabTop       — top of cloud slab (Y coordinate)
+//   slabBottom    — bottom of cloud slab (Y coordinate)
+//   t3D           — time parameter for cloud animation
+//
+// Returns: sunlight transmittance (0..1), where 1 = no shadow, 0 = full shadow
+// ============================================================================
+float getVolumetricCloudShadow(in vec3 worldPos, in vec3 sunDir, in vec3 cameraPos,
+                                float slabTop, float slabBottom, float t3D)
+{
+    // Quick bounds check: if sun is below horizon, no cloud shadow
+    if (sunDir.y < 0.01) return 1.0;
+
+    float slabRange = slabTop - slabBottom;
+
+    // Ray-sphere intersection toward sun (8 steps for performance)
+    const uint shadowSteps = 8u;
+
+    // Start from the terrain position
+    vec3 rayStart = worldPos;
+
+    // If already in cloud slab, sample directly
+    if (rayStart.y < slabTop && rayStart.y > slabBottom) {
+        // Already in slab: trace toward sun slab-top
+        float rayDist = max(slabTop - rayStart.y, 50.0) / sunDir.y;
+    } else if (rayStart.y < slabBottom) {
+        // Below slab: no shadow
+        return 1.0;
+    } else {
+        // Above slab: trace down toward sun-projected point in slab
+        // Find where sun ray intersects the slab
+        float tTop = (slabTop - rayStart.y) / sunDir.y;
+        float tBot = (slabBottom - rayStart.y) / sunDir.y;
+
+        // Only process if sun ray hits the slab at positive t
+        if (tTop < 0.0 || tBot > 10000.0) return 1.0;
+
+        rayStart = rayStart + sunDir * max(tTop - 1.0, 0.0);
+    }
+
+    // Trace toward sun through cloud slab
+    float rayDist = 200.0; // Sample window into clouds
+    vec3 rayDir = normalize(sunDir);
+    uint steps = shadowSteps;
+
+    vec3 rayPos = rayStart;
+    vec3 stepVec = rayDir * (rayDist / float(steps));
+
+    float transmittance = 1.0;
+    float opticalDepth = 0.0;
+
+    for (uint i = 0u; i < steps; ++i) {
+        float h = clamp((rayPos.y - slabBottom) / slabRange, 0.0, 1.0);
+
+        // Sample density at this point
+        float dens = _vc_density3D(rayPos, h, t3D);
+        dens = clamp(dens * CLOUD_FILL * VC_CLOUD_DENSITY_SCALE, 0.0, 1.0);
+
+        float stepLen = length(stepVec);
+
+        // Accumulate optical depth using Beer-Lambert
+        opticalDepth += dens * stepLen * 0.8;
+
+        // Early exit if fully shadowed
+        if (opticalDepth > 3.0) {
+            return 0.05; // Clamp to slight ambient
+        }
+
+        rayPos += stepVec;
+
+        // Stop if exited slab
+        if (rayPos.y > slabTop) break;
+    }
+
+    // Convert optical depth to transmittance using Beer-Lambert law
+    transmittance = exp(-opticalDepth * 1.4);
+
+    // Clamp to ensure some ambient light always reaches (avoid pure black)
+    return max(transmittance, 0.08);
+}

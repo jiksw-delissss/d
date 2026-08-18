@@ -1,0 +1,1409 @@
+#ifndef VOLCUMETRIC_CLOUDS_GLSL
+#define VOLCUMETRIC_CLOUDS_GLSL
+
+#define time fragmentFrameTime
+
+// Include volumetric clouds so they can be rendered in reflections
+#if CLOUD_TYPE == 2 && !defined FORCE_DISABLE_CLOUDS && defined WORLD_LIGHT
+    #include "/lib/rayTracing/volumetricClouds.glsl"
+#endif
+// Fallback for dimensions that don't define day/night uniforms
+
+#if CLOUD_TYPE != 0 && !defined FORCE_DISABLE_CLOUDS && defined WORLD_LIGHT
+// NOTE: under-cloud darkening constant previously configurable via
+// `UNDERCLOUD_DARKNESS_MULT` has been inlined below and the macro
+// removed to simplify shader configuration.
+
+// Enhanced cloud morphing & mixing controls
+#ifndef CLOUD_MORPH_SPEED
+#define CLOUD_MORPH_SPEED 0.7
+#endif
+#ifndef CLOUD_MIX_SPEED
+#define CLOUD_MIX_SPEED 0.7
+#endif
+#ifndef CLOUD_MIX_SPEED
+#define CLOUD_MIX_SPEED 0.7
+#endif
+#ifndef CLOUD_SECONDARY_SCALE
+#define CLOUD_SECONDARY_SCALE 1.6
+#endif
+#ifndef CLOUD_MIX_AMOUNT
+#define CLOUD_MIX_AMOUNT 1.0
+#endif
+#ifndef CLOUD_FILL
+#define CLOUD_FILL 1.6
+#endif
+#ifndef CLOUD_DETAIL_SCALE
+#define CLOUD_DETAIL_SCALE 1.0
+#endif
+#ifndef CLOUD_TURBULENCE_AMOUNT
+#define CLOUD_TURBULENCE_AMOUNT 1.25
+#endif
+
+
+    // 2D hash and noise
+    float hash21(in vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453123); }
+    float noise21(in vec2 p){
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        float a = hash21(i + vec2(0.0,0.0));
+        float b = hash21(i + vec2(1.0,0.0));
+        float c = hash21(i + vec2(0.0,1.0));
+        float d = hash21(i + vec2(1.0,1.0));
+        vec2 u = f * f * (3.0 - 2.0 * f);
+        return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+    }
+
+    float fbm2(in vec2 p){
+        float v = 0.0;
+        float a = 0.5;
+        for(int i = 0; i < 4; i++){
+            v += a * noise21(p);
+            p = mat2(1.6, -1.2, 1.2, 1.6) * p * 1.9;
+            a *= 0.5;
+        }
+        return v;
+    }
+
+    // Cloud density computed by integrating layered fbm along the view ray
+    // Returns vec2: x = existing clouds, y = cirrocumulus clouds
+    vec2 cloudVolume(in vec3 dir, in vec2 uv, in float time){
+        const int STEPS = 3;
+        const float START = 0.15;
+        const float END = 2.0;
+        const float SCALE = 2.5;
+        const float DETAIL = 1.015;
+
+        float sum = 0.0;
+        float weight = 1.0;
+        float t = START;
+        float dt = (END - START) / float(STEPS);
+
+        float morphTime  = time * 0.18;
+        float mixTime    = time * 0.12;
+        float detailTime = time * 1.08;
+
+        vec2 windVariation = vec2(
+            sin(time * 0.05) * 0.3,
+            cos(time * 0.07) * 0.2
+        );
+
+        for(int i = 0; i < STEPS; i++){
+            float stepTime = time + float(i) * 0.7;
+
+            vec3 basePos = vec3(dir.xy * (SCALE * t) + uv * 0.15, t * 0.6 + time * 0.03);
+
+            vec2 turbulence = vec2(
+                sin(basePos.z * 1.5 + stepTime * 0.2) * 0.15,
+                cos(basePos.z * 1.2 + stepTime * 0.15) * 0.12
+            ) * CLOUD_TURBULENCE_AMOUNT;
+
+            vec3 p = basePos + vec3(turbulence + windVariation, 0.0);
+
+            float baseA = fbm2(p.xy * 0.75 + vec2(stepTime * 0.04, 0.0));
+            float baseB = fbm2(p.xy * 0.82 + vec2(0.0, stepTime * 0.03));
+
+            float angC = float(i) * 0.21 + stepTime * 0.01;
+            mat2 rotC = mat2(cos(angC), -sin(angC), sin(angC), cos(angC));
+            float baseC = fbm2(rotC * (p.xy * 0.68) + vec2(stepTime * 0.02));
+
+            float detail1 = fbm2(p.xy * CLOUD_DETAIL_SCALE + vec2(51.3, 7.1) + detailTime * 0.1);
+            float detail2 = fbm2(p.xy * (CLOUD_DETAIL_SCALE * 1.7) + vec2(23.7, 42.9) + detailTime * 0.08);
+            float combinedDetail = mix(detail1, detail2, 0.4) * 0.6 + detail1 * 0.4;
+
+            float morph1 = 0.5 + 0.5 * sin(morphTime * CLOUD_MORPH_SPEED * 1.3 + dot(uv, vec2(0.37,0.61)) * 0.8 + float(i) * 0.31);
+            float morph2 = 0.5 + 0.5 * cos(morphTime * CLOUD_MORPH_SPEED * 0.7 + dot(uv, vec2(0.21,0.89)) * 0.6 + float(i) * 0.42);
+
+            float shapeAB     = mix(baseA, baseB, smoothstep(0.0, 1.0, morph1));
+            float blendedBase = mix(shapeAB, baseC, smoothstep(0.0, 1.0, morph2));
+
+            float secondary1 = fbm2(p.xy * CLOUD_SECONDARY_SCALE + vec2(13.7, 9.2) + mixTime * 0.05);
+            float secondary2 = fbm2(p.xy * (CLOUD_SECONDARY_SCALE * 0.6) + vec2(31.4, 17.3) + mixTime * 0.03);
+            float secondary3 = fbm2(p.xy * (CLOUD_SECONDARY_SCALE * 1.3) + vec2(7.9, 23.6) + mixTime * 0.04);
+            float combinedSecondary = (secondary1 * 0.5 + secondary2 * 0.3 + secondary3 * 0.2);
+
+            float densityMain = smoothstep(0.4, 0.78, blendedBase + 0.45 * combinedDetail);
+
+            float mixOsc1 = 0.5 + 0.5 * sin(mixTime * CLOUD_MIX_SPEED * 0.9 + dot(uv, vec2(0.21,0.47)) * 0.7);
+            float mixOsc2 = 0.5 + 0.5 * cos(mixTime * CLOUD_MIX_SPEED * 1.2 + dot(uv, vec2(0.67,0.33)) * 0.5);
+            float dynamicMixAmount = mix(mixOsc1, mixOsc2, 0.5) * CLOUD_MIX_AMOUNT;
+
+            float combinedDensity = mix(densityMain, clamp(combinedSecondary * 0.85, 0.0, 1.0), dynamicMixAmount);
+
+            float wispyFactor = pow(combinedDetail, 2.0) * 0.3;
+            combinedDensity = combinedDensity * (1.0 - wispyFactor) + wispyFactor * 0.7;
+
+            float heightVariation = 1.0 + sin(p.z * 1.5 + time * 0.1) * 0.15;
+            float heightFade = exp(-t * 0.7) * heightVariation;
+
+            sum += combinedDensity * weight * heightFade;
+
+            weight *= mix(0.75, 0.82, fract(float(i) * 0.37 + time * 0.01));
+            t += dt;
+        }
+
+        float dens = clamp(sum * 0.35, 0.0, 1.0);
+        dens = pow(dens, 1.05);
+        dens = smoothstep(0.06, 0.92, dens);
+
+        float largeScaleVariation = fbm2(uv * 0.1 + time * 0.001) * 0.2 + 0.9;
+        dens *= largeScaleVariation;
+        dens = clamp(dens * CLOUD_FILL, 0.0, 1.0);
+
+        return vec2(dens, 0.0);
+    }
+
+    // SEUS-derived helpers (adapted): 2D/3D noise and coverage
+    float Get2DNoise(in vec3 pos)
+    {
+        vec2 p = floor(pos.xz + 0.5);
+        vec2 f = fract(pos.xz + 0.5);
+
+        f.x = f.x * f.x * (3.0 - 2.0 * f.x);
+        f.y = f.y * f.y * (3.0 - 2.0 * f.y);
+
+        vec2 uv = (p + f + 0.5) / float(64);
+        return texture2D(noisetex, uv).x;
+    }
+
+    float Get3DNoise(in vec3 pos)
+    {
+        vec3 p = floor(pos + 0.5);
+        vec3 f = fract(pos + 0.5);
+
+        f = f * f * (3.0 - 2.0 * f);
+
+        vec2 uv = (p.xy + p.z * vec2(17.0)) + f.xy;
+        vec2 coord = (uv + 0.5) / float(64);
+        vec2 coord2 = (uv + vec2(17.0) + 0.5) / float(64);
+        float xy1 = texture2D(noisetex, coord).x;
+        float xy2 = texture2D(noisetex, coord2).x;
+        return mix(xy1, xy2, f.z);
+    }
+
+    float GetCoverage(in float coverage, in float density, in float clouds)
+    {
+        clouds = clamp(clouds - (1.0 - coverage), 0.0, 1.0 - density) / (1.0 - density);
+        clouds = max(0.0, clouds * 1.1 - 0.1);
+        clouds = clouds * clouds * (3.0 - 2.0 * clouds);
+        return clouds;
+    }
+
+    float CalculateSunglow(vec3 npos, vec3 lightVector) {
+        vec3 halfVector2 = normalize(-lightVector + npos);
+        float factor = 1.0 - dot(halfVector2, npos);
+        return factor * factor * factor * factor;
+    }
+
+    // SEUS cloud color sampler (simplified/adapted): returns vec4(rgb, alpha)
+    vec4 SEUS_CloudColor(in vec4 worldPosition, in float sunglow, in vec3 worldLightVector, in float altitude, in float thickness)
+    {
+        float cloudHeight = altitude;
+        float cloudDepth  = thickness;
+
+        vec3 p = worldPosition.xyz / 150.0;
+        float t = fragmentFrameTime * 1.0;
+        p += (Get2DNoise(p * 2.0 + vec3(0.0, t * 0.00, 0.0)) * 2.0 - 1.0) * 0.10;
+        p.z -= (Get2DNoise(p * 0.25 + vec3(0.0, t * 0.00, 0.0)) * 2.0 - 1.0) * 0.45;
+        p.x -= (Get2DNoise(p * 0.125 + vec3(0.0, t * 0.00, 0.0)) * 2.0 - 1.0) * 2.2;
+        p.xz -= (Get2DNoise(p * 0.0525 + vec3(0.0, t * 0.00, 0.0)) * 2.0 - 1.0) * 2.7;
+        p.x *= 0.5;
+        p.x -= t * 0.01;
+
+        vec3 p1 = p * vec3(1.0, 0.5, 1.0)  + vec3(0.0, t * 0.01, 0.0);
+        float noise  = Get2DNoise(p * vec3(1.0, 0.5, 1.0) + vec3(0.0, t * 0.01, 0.0));
+        p *= 2.0; p.x -= t * 0.057; vec3 p2 = p;
+        noise += (2.0 - abs(Get2DNoise(p) * 2.0 - 0.0)) * (0.15); p *= 3.0; p.xz -= t * 0.035; p.x *= 2.0; vec3 p3 = p;
+        noise += (3.0 - abs(Get2DNoise(p) * 3.0 - 0.0)) * (0.050); p *= 3.0; p.xz -= t * 0.035; vec3 p4 = p;
+        noise += (3.0 - abs(Get2DNoise(p) * 3.0 - 0.0)) * (0.015); p *= 3.0; p.xz -= t * 0.035;
+        noise += ((Get2DNoise(p))) * (0.022); p *= 3.0; noise += ((Get2DNoise(p))) * (0.009);
+        noise /= 1.475;
+
+        float coverage = 0.701;
+        coverage = mix(coverage, 0.97, rainStrength);
+        float dist = length(worldPosition.xz - cameraPosition.xz * 0.5);
+        coverage *= max(0.0, 1.0 - dist / 14000.0);
+        float density = 0.1 + rainStrength * 0.3;
+
+        noise = GetCoverage(coverage, density, noise);
+
+        float sundiff = Get2DNoise(p1 + worldLightVector.xyz * 0.4);
+        sundiff += (2.0 - abs(Get2DNoise(p2 + worldLightVector.xyz * 0.2) * 2.0 - 0.0)) * (0.55);
+        float largeSundiff = sundiff;
+        largeSundiff = -GetCoverage(coverage, 0.0, largeSundiff * 1.3);
+        sundiff += (3.0 - abs(Get2DNoise(p3 + worldLightVector.xyz * 0.08) * 3.0 - 0.0)) * (0.045);
+        sundiff += (3.0 - abs(Get2DNoise(p4 + worldLightVector.xyz * 0.05) * 3.0 - 0.0)) * (0.015);
+        sundiff /= 1.5;
+        sundiff *= max(0.0, 1.0 - dist / 14000.0);
+        sundiff = -GetCoverage(coverage * 1.0, 0.0, sundiff);
+        float secondOrder = pow(clamp(sundiff * 1.1 + 1.45, 0.0, 1.0), 4.0);
+        float firstOrder  = pow(clamp(largeSundiff * 1.1 + 1.66, 0.0, 1.0), 3.0);
+
+        float directLightFalloff = firstOrder * secondOrder;
+        float anisoBackFactor = mix(clamp(pow(noise, 1.6) * 2.5, 0.0, 1.0), 1.0, pow(sunglow, 1.0));
+        directLightFalloff *= anisoBackFactor;
+        directLightFalloff *= mix(11.5, 1.0, pow(sunglow, 0.5));
+
+        vec3 colorDirect = sunCol * 11.215;
+        colorDirect = mix(colorDirect, colorDirect * vec3(0.2,0.2,0.2), 1.0 - dayCycle);
+        colorDirect *= 1.0 + pow(sunglow, 2.0) * 120.0 * pow(directLightFalloff, 1.1) * (1.0 - rainStrength * 0.8);
+
+        vec3 colorAmbient = mix(skyCol, sunCol * 2.0, vec3(0.12)) * 0.80;
+        colorAmbient = mix(colorAmbient, vec3(0.4) * (dot(skyCol, vec3(0.2126,0.7152,0.0722))), vec3(rainStrength));
+        colorAmbient *= mix(1.0, 0.3, 1.0 - dayCycle);
+        colorAmbient = mix(colorAmbient, colorAmbient * 3.0 + sunCol * 0.05, vec3(clamp(pow(1.0 - noise, 12.0) * 1.0, 0.0, 1.0)));
+
+        vec3 color = mix(colorAmbient, colorDirect, vec3(min(1.0, directLightFalloff)));
+        color *= 1.0;
+        color = mix(color, color * 0.9, rainStrength);
+
+        return vec4(color.rgb, noise);
+    }
+
+    // Forward declaration — seusAtmosphere is defined later in this file but
+    // called inside getSkyClouds for dynamic cloud shading colors.
+    vec3 seusAtmosphere(vec3 rayDir, vec3 lightDir);
+
+    // ── 3D Cumulus Cloud Density ─────────────────────────────────────────────
+    // Samples cloud density at a world-space position using layered FBM noise.
+    // Produces the classic cumulus shape: flat bottom, cauliflower-puffy top.
+    //
+    //  pos.xz  — horizontal position (driven by ray-marched skybox layers)
+    //  h       — normalised height within cloud layer [0=bottom, 1=top]
+    float cumulusDensity(vec2 pos, float h, float time) {
+        // Vertical profile: sharp flat base, smooth rounded top (cumulus signature)
+        // h=0 is bottom of layer, h=1 is top. Clamp to [0,1].
+        float heightGrad = smoothstep(0.0, 0.18, h) * smoothstep(1.0, 0.55, h);
+        if(heightGrad < 0.001) return 0.0;
+
+        // Large-scale organiser — slow-moving base cells give cloud family placement
+        float coarse = fbm2(pos * 0.22 + vec2(time * 0.012, time * 0.009));
+
+        // Mid-scale puffiness — adds the 'cauliflower' lobes
+        float mid    = fbm2(pos * 0.58 + vec2(time * 0.025, -time * 0.018) + 3.7);
+
+        // Fine detail — small wispy edges, erodes density outward
+        float fine   = fbm2(pos * 1.35 + vec2(-time * 0.04, time * 0.031) + 7.3);
+
+        // Build base density: coarse drives coverage, mid adds lobe structure
+        float base = coarse * 0.62 + mid * 0.28 + fine * 0.10;
+
+        // Threshold to get distinct cloud/gap separation (cumulus ≠ stratus overcast)
+        float cov = CLOUD_FILL * 0.62;
+        base = smoothstep(0.48 - cov * 0.18, 0.82, base);
+
+        // Erode the top half with finer detail — tall puffy towers taper upward
+        float topErosion = fbm2(pos * 1.8 + vec2(time * 0.05, 0.0) + 13.1);
+        float topFactor  = smoothstep(0.45, 1.0, h); // only erodes upper half
+        base -= topErosion * 0.35 * topFactor;
+
+        // Multiply by height gradient for the flat bottom / puffy top envelope
+        return clamp(base * heightGrad, 0.0, 1.0);
+    }
+
+    // Sky clouds render — 3D volumetric cumulus within the skybox projection
+    // Approach: cast N horizontal layers through the cloud altitude band,
+    // accumulate density, then shade with proper volumetric lighting.
+    vec3 getSkyClouds(in vec3 nEyePlayerPos, in vec3 currSkyCol){
+        // Early-out when looking at or below the horizon
+        float cloudHeightFade = nEyePlayerPos.y - 0.05;
+        #ifdef FORCE_DISABLE_WEATHER
+            cloudHeightFade *= 6.0;
+        #else
+            cloudHeightFade -= rainStrength * 0.18;
+            cloudHeightFade *= 5.6 - rainStrength * 4.5;
+        #endif
+        if(cloudHeightFade <= 0.0) return currSkyCol;
+        cloudHeightFade = clamp(cloudHeightFade, 0.0, 1.0);
+
+        // ── Sun direction ─────────────────────────────────────────────────
+        vec3 sunDir = normalize(transpose(mat3(shadowModelView)) * vec3(0., 0., 1.));
+        #ifndef FORCE_DISABLE_DAY_CYCLE
+            if(dayCycle < 1.0) sunDir = -sunDir;
+        #endif
+        float sunHeight    = max(0.01, sunDir.y);
+        float lowSunFactor = clamp(1.0 - sunHeight * 1.4, 0.0, 1.0);
+
+        // ── Wind / time ───────────────────────────────────────────────────
+        float time       = fragmentFrameTime * 0.18;
+        vec2 windOffset  = vec2(fragmentFrameTime * 0.055, fragmentFrameTime * 0.0035);
+
+        // ── Cloud layer geometry ─────────────────────────────────────────
+        // Project view ray to a thin altitude slab (sky-space), then march
+        // N virtual layers through the slab to build 3-D volumetric density.
+        // Scale controls how 'zoomed-in' the clouds appear.
+        const float CLOUD_SCALE   = 5.8;
+        const float LAYER_STEPS   = 4.0; // reduced from 6 for better performance
+        const float LAYER_STEP_H  = 1.0 / LAYER_STEPS;
+
+        // Base UV at the midpoint of the cloud slab
+        vec2 baseUv = nEyePlayerPos.xz * (CLOUD_SCALE / max(0.0001, nEyePlayerPos.y));
+
+        // ── Multi-layer vertical accumulation ─────────────────────────────
+        // Each layer is offset slightly in XZ (parallax) and has a different h
+        // value, giving the illusion of vertical depth and puffiness.
+        float totalDensity    = 0.0;
+        float topDensity      = 0.0;  // density seen from above (lit tops)
+        float bottomDensity   = 0.0;  // density at base (flat underside)
+        float depthWeight     = 0.0;
+
+        // Parallax shift: layers that are 'higher' appear slightly offset
+        // in XZ when viewed from below, creating the 3-D parallax effect.
+        // The offset is proportional to the horizontal view angle.
+        vec2 parallaxDir = nEyePlayerPos.xz / max(0.001, nEyePlayerPos.y);
+
+        for(float li = 0.0; li < LAYER_STEPS; li += 1.0) {
+            float h        = (li + 0.5) * LAYER_STEP_H;          // [0..1] bottom→top
+            float parallax = (h - 0.5) * 0.55;                   // shift ±0.275
+            vec2 layerUv   = baseUv + windOffset + parallaxDir * parallax;
+
+            float d = cumulusDensity(layerUv, h, time);
+
+            // Rain: denser overcast, spread bottoms
+            #ifndef FORCE_DISABLE_WEATHER
+                d = clamp(d + rainStrength * 0.55, 0.0, 1.0);
+            #endif
+
+            totalDensity  += d * LAYER_STEP_H;
+            topDensity    += d * h * LAYER_STEP_H;           // weighted toward top
+            bottomDensity += d * (1.0 - h) * LAYER_STEP_H;  // weighted toward bottom
+            depthWeight   += LAYER_STEP_H;
+        }
+        // Normalise
+        float density       = clamp(totalDensity,    0.0, 1.0);
+        float topWeight     = depthWeight > 0.001 ? clamp(topDensity    / (density + 0.001), 0.0, 1.0) : 0.5;
+        float bottomWeight  = depthWeight > 0.001 ? clamp(bottomDensity / (density + 0.001), 0.0, 1.0) : 0.5;
+
+        if(density < 0.01) return currSkyCol;
+
+        // Apply fill scaling
+        density = clamp(density * CLOUD_FILL, 0.0, 1.0);
+
+        // ── Atmosphere samples for dynamic shading (optimized) ───────────
+        vec3 horizSunDir    = normalize(vec3(sunDir.x, 0.02, sunDir.z));
+        vec3 atmosHorizSun  = clamp(seusAtmosphere(horizSunDir,  sunDir), vec3(0.0), vec3(6.0));
+        vec3 atmosUp        = clamp(seusAtmosphere(vec3(0.0, 1.0, 0.0), sunDir), vec3(0.0), vec3(4.0));
+        // Reduce expensive horizon/anti-sun samples for performance
+        vec3 atmosHorizAnti = mix(atmosHorizSun * 0.5, atmosUp * 0.4, 0.7);
+        vec3 atmosDown      = mix(atmosHorizSun * 0.3, vec3(0.05, 0.06, 0.1), 0.6);
+
+        float sunViewDot    = clamp(dot(normalize(nEyePlayerPos), sunDir), 0.0, 1.0);
+        float sunProximity  = (sunViewDot * sunViewDot * sunViewDot);  // optimized from pow(sunViewDot, 3.5)
+        float sunGlowFactor = (sunViewDot * sunViewDot) * dayCycle;  // optimized from pow(sunViewDot, 1.2)
+        float antiSunFactor = clamp(1.0 - sunViewDot, 0.0, 1.0);
+
+        vec3 atmosViewDir   = mix(atmosUp, atmosHorizSun, sunGlowFactor * 0.65);
+        float antiSqrd = antiSunFactor * antiSunFactor;
+        vec3 atmosAmbient   = mix(atmosViewDir, atmosHorizAnti * 0.7, antiSqrd * antiSunFactor * 0.4);
+        vec3 scatterShade   = mix(atmosHorizAnti * 0.5, atmosHorizSun * 0.35, sunGlowFactor * 0.5);
+             scatterShade   = mix(scatterShade, vec3(0.04, 0.05, 0.08), 0.3);
+
+        // ── Sun color ─────────────────────────────────────────────────────
+        #ifdef FORCE_DISABLE_DAY_CYCLE
+            vec3 directSunColor = lightCol * 2.2;
+            vec3 moonLightCol   = lightCol;
+        #else
+            vec3 moonLightCol   = moonCol;
+            vec3 directSunColor = mix(moonLightCol * 0.8,
+                                      mix(sunCol * 2.0, atmosHorizSun * 1.6, lowSunFactor * 0.5 + sunProximity * 0.3),
+                                      dayCycleAdjust);
+        #endif
+        directSunColor = mix(directSunColor, directSunColor * vec3(1.35, 0.95, 0.6), lowSunFactor * 0.6);
+        float nightDim = mix(0.08, 1.0, dayCycle);
+
+        // ── 3D Volumetric Lighting (optimized) ────────────────────────────
+        // TOPS: bright white/warm lit by sun. topWeight tells us how much
+        //       density lives in the upper half (the puffy towers).
+        // Use squared multiplication instead of expensive pow()
+        float sv4 = sunViewDot * sunViewDot * sunViewDot * sunViewDot;
+        float silverLining = sv4 * smoothstep(0.0, 0.4, sunHeight);
+        float sunBurst     = sv4 * sv4 * lowSunFactor * dayCycle;  // approximates pow(sunViewDot, 8)
+
+        // Beer-Lambert self-shadow through cloud depth toward sun
+        // Sample density shifted toward the sun horizontally to approximate
+        // the shadow cast by one part of the cloud on another.
+        vec2 sunXZDir     = sunDir.xz;
+        float sunXZLen    = max(length(sunXZDir), 0.001);
+        vec2 sunShiftDir  = (sunXZDir / sunXZLen) * (0.45 + (1.0 - sunHeight) * 1.6);
+
+        // Sample two offset positions (optimized from 3) to build optical depth estimate
+        vec2 shiftedUv1 = baseUv + windOffset + sunShiftDir * 0.40;
+        vec2 shiftedUv2 = baseUv + windOffset + sunShiftDir * 0.90;
+        float occ1 = cumulusDensity(shiftedUv1, 0.65, time);
+        float occ2 = cumulusDensity(shiftedUv2, 0.55, time);
+        float optDepth   = (occ1 * 0.6 + occ2 * 0.4) * density * 3.2;  // stronger optical depth
+        float beerShadow = exp(-optDepth * 2.2);  // more aggressive self-shadowing
+
+        // Ambient occlusion: denser cloud cores are significantly darker (interior lighting)
+        float ao = 1.0 - clamp(density * 0.85, 0.0, 0.78);  // deeper AO for stormy realism
+
+        // ── TOP LAYER — sunlit cauliflower tops ──────────────────────────
+        // topWeight drives how much of the visible density is upper (puffy tops)
+        // Warmer tint at low sun angles — matches golden/orange tops seen in reference photos
+        vec3 topSunlit = directSunColor * (1.0 + silverLining * 3.5 + sunBurst * 5.0);
+             topSunlit *= beerShadow * ao;
+             // Brighten tops where density is thin (wispy cloud edges catch light)
+             topSunlit *= mix(1.0, 1.4, smoothstep(0.6, 0.1, density));
+
+        // ── MIDDLE LAYER — shaded body ───────────────────────────────────
+        // The interior of cumulus — mix sun-lit and scatter-shaded
+        float NdotL = clamp(sunDir.y * 0.5 + 0.5, 0.0, 1.0); // simplified surface NdotL
+        float shadowDepth   = clamp((1.0 - beerShadow) + (1.0 - NdotL) * 0.5, 0.0, 1.0);
+        vec3 midCloudColor  = mix(scatterShade * 0.75, vec3(0.04, 0.05, 0.08), shadowDepth * 0.45);
+             midCloudColor *= ao;
+
+        // ── BOTTOM LAYER — flat, shadowed underside ──────────────────────
+        // bottomWeight: how much density is at the base (the flat bottom of cumulus)
+        // Real cumulus bottoms are distinctly flat and VERY dark — almost charcoal-grey/blue.
+        // Reference photos show near-black undersides with subtle warm rim from scattered sun.
+        vec3 undersideBase  = mix(atmosHorizAnti * 0.22, atmosDown * 0.35, 0.55);
+             undersideBase  = mix(undersideBase, atmosHorizSun * 0.10, sunProximity * lowSunFactor * 0.40);
+        vec3 undersideColor = mix(undersideBase, vec3(0.012, 0.016, 0.030), 0.68);
+             undersideColor *= ao * 0.52;  // much darker ao for realistic shadowed underside
+        // The flat bottom is most visible at low view angles (near-horizon clouds)
+        float undersideMix  = clamp(bottomWeight * 1.6 * (1.0 - nEyePlayerPos.y * 1.5), 0.0, 1.0);
+
+        // ── Blend all three zones ────────────────────────────────────────
+        // topWeight  → sunny tops
+        // bottomWeight → dark flat undersides
+        // remainder  → body shading
+        vec3 directCloud = mix(midCloudColor, topSunlit,    clamp(topWeight    * 1.3, 0.0, 1.0));
+             directCloud = mix(directCloud,   undersideColor, undersideMix * 0.88);
+
+        // ── Ambient fill ─────────────────────────────────────────────────
+        float nightAmbientFactor = mix(0.05, 1.0, dayCycle);
+        float upDot = clamp(nEyePlayerPos.y, 0.0, 1.0);
+        vec3 cloudAmbient  = atmosAmbient * 0.24 * nightAmbientFactor * upDot;
+             cloudAmbient += atmosHorizSun * 0.17 * sunProximity * lowSunFactor * dayCycle * upDot;
+             cloudAmbient += atmosDown * 0.06 * upDot;
+
+        // ── Final composite ──────────────────────────────────────────────
+        // Small transparency variation breaks up hard edges and adds wispy detail
+        float edgeNoise = fbm2(baseUv * 0.28 + windOffset * 0.4) * 0.22 + 0.78;
+        float clouds    = density * cloudHeightFade * 2.0 * edgeNoise;
+
+        vec3 cloudCol = (directCloud + cloudAmbient) * nightDim * clouds;
+
+        // Under-cloud sky darkening (flat base of cumulus casts a shadow)
+        // Increased from 0.48 to 0.65 — matches the dramatic darkening under thick clouds
+        // seen in the reference photos (bright golden sky transitions to dark beneath cloud)
+        float viewFactor     = 1.0 - max(upDot, 0.0);
+        float underCloudDark = clamp(pow(density, 1.0) * 0.65 * cloudHeightFade
+                                     * (0.40 + viewFactor * 1.3), 0.0, 0.95);
+        currSkyCol *= (1.0 - underCloudDark);
+
+        return currSkyCol + cloudCol * density;
+    }
+
+#endif
+
+
+mat2 mm2(in float a){float c = cos(a), s = sin(a);return mat2(c,s,-s,c);}
+mat2 m2 = mat2(0.95534, 0.29552, -0.29552, 0.95534);
+float tri(in float x){return clamp(abs(fract(x)-.5),0.01,0.49);}
+vec2 tri2(in vec2 p){return vec2(tri(p.x)+tri(p.y),tri(p.y+tri(p.x)));}
+
+float triNoise2d(in vec2 p, float spd)
+{
+    float z=1.8;
+    float z2=2.5;
+	float rz = 0.;
+    p *= mm2(p.x*0.06);
+    vec2 bp = p;
+	for (float i=0.; i<5.; i++ )
+	{
+        vec2 dg = tri2(bp*1.85)*.75;
+        dg *= mm2(time*spd);
+        p -= dg/z2;
+
+        bp *= 1.3;
+        z2 *= .45;
+        z *= .42;
+		p *= 1.21 + (rz-1.0)*.02;
+        
+        rz += tri(p.x+tri(p.y))*z;
+        p*= -m2;
+	}
+    return clamp(1./pow(rz*29., 1.3),0.,.55);
+}
+
+float auroraHash21(in vec2 n){ return fract(sin(dot(n, vec2(12.9898, 4.1414))) * 43758.5453); }
+vec4 aurora(vec3 ro, vec3 rd)
+{
+    vec4 col = vec4(0);
+    vec4 avgCol = vec4(0);
+
+    for(float i=0.;i<25.;i++) // Reduced from 50 to 25 for better performance
+    {
+        float of = 0.0;
+        float pt = ((.8+pow(i,1.4)*.002)-ro.y)/(rd.y*2.+0.4);
+        pt -= of;
+    	vec3 bpos = ro + pt*rd;
+        vec2 p = bpos.zx;
+        float rzt = triNoise2d(p, 0.06);
+        vec4 col2 = vec4(0,0,0, rzt);
+        col2.rgb = (sin(1.-vec3(2.15,-.5, 1.2)+i*0.043)*0.5+0.5)*rzt;
+        avgCol =  mix(avgCol, col2, .5);
+        col += avgCol*exp2(-i*0.065 - 2.5)*smoothstep(0.,5., i);
+
+    }
+
+    return col*0.5; // Increased intensity
+}
+
+// Singularity blackhole shader by @XorDev
+vec4 singularity(vec2 F, float iTime)
+{
+    //Iterator and attenuation (distance-squared)
+    float i = .2, a;
+    //Resolution for scaling and centering (reduced for larger effect)
+    vec2 r = vec2(400,300),
+         //Centered ratio-corrected coordinates
+         p = ( F+F - r ) / r.y / .7,
+         //Diagonal vector for skewing
+         d = vec2(-1,1),
+         //Blackhole center
+         b = p - i*d,
+         //Rotate and apply perspective
+         c = p * mat2(1, 1, d/(.1 + i/dot(b,b))),
+         //Rotate into spiraling coordinates
+         v = c * mat2(cos(.5*log(a=dot(c,c)) + iTime*i + vec4(0,33,11,0)))/i,
+         //Waves cumulative total for coloring
+         w;
+    
+    //Loop through waves
+    for(; i++<9.; w += 1.+sin(v) )
+        //Distort coordinates
+        v += .7* sin(v.yx*i+iTime) / i + .5;
+    //Acretion disk radius
+    i = length( sin(v/.3)*.4 + c*(3.+d) );
+    //Red/blue gradient
+    return 1. - exp( -exp( c.x * vec4(.6,-.4,-1,0) )
+                   //Wave coloring
+                   /  w.xyyx
+                   //Acretion disk brightness
+                   / ( 2. + i*i/4. - i )
+                   //Center darkness
+                   / ( .5 + 1. / a )
+                   //Rim highlight
+                   / ( .03 + abs( length(p)-.7 ) )
+             );
+}
+
+// Shooting star effect
+vec3 shootingStar(vec2 uv, float time, float xPos)
+{
+    // set to 0 for straight path like sun and moon
+    const float SQUISH_H = 0.0;
+    // precondition: abs(SQUISH_V) <= 1.0
+    // increase in magnitude to vertically expand star path
+    const float SQUISH_V = 0.0; // Set to 0 for straight path like real shooting star
+    // increase to widen star tail
+    const float LINERADIUS = 0.0005; // Made larger for visibility
+    // increase to compress star body (including glow)
+    const float CENTERPOWER = 8000.0; // Lower compression for larger body
+    // precondition: TWINKLECAP >= 0.0
+    // increase to increase maximum twinkle size
+    const float TWINKLECAP = 6000.0; // Larger twinkle
+    // precondition: CENTERBASE > 1.0
+    // increase to make glow more solid (less glowy)
+    const float CENTERBASE = 1.5;
+    // decrease to shorten star tail
+    const float ERASEPOWER = -5.0; // Increased to make trail shorter
+    // precondition: ERASEBASE <= 1.0
+    // decrease to shorten star tail
+    const float ERASEBASE = 0.5;
+    // precondition: 0.0 < R <= 1.0
+    const float R = 1.0;
+    // precondition: 0.0 < G <= 1.0
+    const float G = 1.0;
+    // precondition: 0.0 < B <= 1.0
+    const float B = 1.0;
+    // precondition: 0.0 <= YPOS <= 1.0
+    const float YPOS = 0.5;
+    // precondition: SPEED != 0
+    // increase to speed up star oscillation
+    const float SPEED = -1.5; // Negative to make star move from left to right
+    // precondition: ANTIALIAS >= 0 and ANTIALIAS <= LINERADIUS / 2
+    const float ANTIALIAS = 0.0;
+
+    // Coords of sinusoidal curve
+    vec2 xy = vec2(uv.x, SQUISH_V * cos(SQUISH_H * uv.x + SPEED * time) + YPOS);
+
+    // Color pixels on curve with antialiasing
+    float edgeTransW = ANTIALIAS * 0.001; // Adjusted for shader coords
+    float abEdge = xy.y - LINERADIUS;
+    float aboveBottom = smoothstep(abEdge - edgeTransW, abEdge + edgeTransW, uv.y);
+    float belowTop = smoothstep(uv.y - edgeTransW, uv.y + edgeTransW, xy.y + LINERADIUS);
+    float isLeft = smoothstep(uv.x - edgeTransW, uv.x + edgeTransW, xPos);
+    float bc = aboveBottom * belowTop * isLeft;
+
+    // Coords of point in H center on curve
+    vec2 cen = vec2(xPos, SQUISH_V * cos(SQUISH_H * xPos + SPEED * time) + YPOS);
+
+    // Color pixels on or near center
+    float cDistance = distance(uv, cen);
+    float twinkle = abs(fract(time * 0.5) - 0.5); // Slower twinkle
+    float cd = pow(CENTERBASE, CENTERBASE - (CENTERPOWER - TWINKLECAP * twinkle) * cDistance);
+
+    // Erasing color of pixels far from center
+    float chDistance = abs(xPos - uv.x);
+    float ed = pow(ERASEBASE, ERASEPOWER * chDistance) - 1.0;
+
+    vec3 col = vec3(R, G, B) * (bc + cd) - ed;
+
+    return max(col, vec3(0.0)); // Ensure no negative values
+}
+
+// ============================================================================
+// Atmospheric scattering — SEUS Renewed unit-sphere model
+// Ported faithfully from SEUS Renewed v1.0.1 (gbuffers_textured.fsh).
+// Key visual signature: deep saturated blue dome, warm orange/red limb at
+// sunrise/sunset, clean horizon gradient with no grey washout.
+// ============================================================================
+
+#define PI  3.14159265359
+#define TAU 6.28318530718
+
+// Unit-sphere atmosphere geometry (matches SEUS exactly)
+#define ATMOS_R_INNER 0.985   // planet surface radius
+#define ATMOS_R       1.0     // outer atmosphere radius
+
+// Scatter constants — physically-inspired for realistic sky appearance.
+// Rayleigh: deep blue zenith (like real midday sky), strong warm limb at sunset.
+// Mie: tight forward sun glow, visible aureole but not overdone.
+// C_R wavelength follows λ^-4 physics: red scatters least, blue scatters most.
+#define ATMOS_K_R  0.270      // Rayleigh — strong blue dome, realistic midday depth
+#define ATMOS_K_M  0.038      // Mie — tighter halo, less milky-white sun disk
+#define ATMOS_E    18.5       // Sun intensity — vivid saturated colors
+#define ATMOS_C_R  vec3(0.14, 0.36, 1.0)  // λ^-4 wavelength curve: red=low, blue=high
+#define ATMOS_G_M  (-0.82)    // Mie asymmetry — strong forward scattering (realistic)
+#define ATMOS_SCALE_H  (4.0 / (ATMOS_R - ATMOS_R_INNER))
+#define ATMOS_SCALE_L  (1.0 / (ATMOS_R - ATMOS_R_INNER))
+
+// --- Shadertoy-derived helpers (adapted to this shader's uniforms) ---
+// Noise sampling using the project's noise texture `noisetex`.
+float Noise( in vec3 x )
+{
+    vec3 p = floor(x);
+    vec3 f = fract(x);
+    f = f*f*(3.0-2.0*f);
+    vec2 uv = (p.xy+vec2(37.0,17.0)*p.z) + f.xy;
+    vec2 rg = textureLod(noisetex, (uv + 0.5)/256.0, 0.0).yx;
+    return mix( rg.x, rg.y, f.z );
+}
+
+float fnoise( vec3 p, in float t )
+{
+    p *= .25;
+    float f;
+    f  = 0.5000   * Noise(p); p = p * 3.02; p.y -= t*.1;
+    f += 0.2500   * Noise(p); p = p * 3.03; p.y += t*.06;
+    f += 0.1250   * Noise(p); p = p * 3.01;
+    f += 0.0625   * Noise(p); p = p * 3.03;
+    f += 0.03125  * Noise(p); p = p * 3.02;
+    f += 0.015625 * Noise(p);
+    return f;
+}
+
+// Ray–sphere intersection.  Returns vec2(t_near, t_far); t_far < 0 = no hit.
+vec2 atmos_RaySphere(vec3 pos, vec3 dir, float r) {
+    float b  = dot(pos, dir);
+    float c  = dot(pos, pos) - r * r;
+    float det = b * b - c;
+    if (det < 0.0) return vec2(10000.0, -10000.0);
+    det = sqrt(det);
+    return vec2(-b - det, -b + det);
+}
+
+// Atmospheric density at point p (exponential scale-height)
+float atmos_density(vec3 p) {
+    return exp(-(length(p) - ATMOS_R_INNER) * ATMOS_SCALE_H) * 2.0;
+}
+
+// Optical depth integral along segment p→q (out-scatter ray, 2 steps - optimized)
+float atmos_optic(vec3 p, vec3 q) {
+    const int N = 2;
+    vec3 step = (q - p) / float(N) * 0.3;
+    vec3 v    = p + step * 0.5;
+    float sum = 0.0;
+    for (int i = 0; i < N; ++i) {
+        sum += atmos_density(v);
+        v   += step;
+    }
+    return sum * length(step) * ATMOS_SCALE_L;
+}
+
+// In-scatter integral along view ray (SEUS in_scatter, 4 steps)
+// rayleighAmount / mieAmount let callers tune each contribution independently.
+vec3 atmos_inScatter(vec3 origin, vec3 dir, vec2 e, vec3 lightDir,
+                     float mieAmount, float rayleighAmount)
+{
+    const int N = 3;
+
+    float K_R = ATMOS_K_R * rayleighAmount;
+    float K_M = ATMOS_K_M * mieAmount;
+
+    // SEUS "boosty": stretches ray length at low sun angles so the horizon
+    // scatters through much more atmosphere — this is what gives the wide
+    // orange/red limb at sunrise/sunset.
+    // Stronger exponent for more dramatic warm horizon glow, matching real photos.
+    float boosty = clamp(lightDir.y + 0.1, 0.0, 1.0) * 0.95 + 0.05;
+    boosty = 1.0 / pow(sin(boosty), 0.70); // stronger low-angle stretch → rich warm horizon
+
+    float len = e.y / float(N);
+    vec3  stp = dir * len * boosty; // stretch steps at low-sun angles → rich horizon color
+    vec3  v   = origin + dir * (len * 0.5);
+
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < N; ++i) {
+        vec2 f = atmos_RaySphere(v, lightDir, ATMOS_R);
+        vec3 u = v + lightDir * f.y;
+
+        float n = (atmos_optic(origin, v) + atmos_optic(v, u)) * (PI * 4.0);
+
+        sum += atmos_density(v) * exp(-n * (K_R * ATMOS_C_R + K_M));
+        v   += stp;
+    }
+    sum *= len * ATMOS_SCALE_L;
+
+    float c  = dot(dir, -lightDir);
+    float cc = c * c;
+
+    // Rayleigh phase: 3/4*(1+cos²θ)
+    float phaseR = 0.75 * (1.0 + cc);
+    // Mie / Henyey-Greenstein phase
+    float gg   = ATMOS_G_M * ATMOS_G_M;
+    float phaseM = 1.5 * ((1.0 - gg) * (1.0 + cc))
+                 / ((2.0 + gg) * pow(1.0 + gg - 2.0 * ATMOS_G_M * c, 1.5));
+
+    return sum * (K_R * ATMOS_C_R * phaseR + K_M * phaseM) * ATMOS_E;
+}
+
+// Secondary (ambient / skylight) in-scatter — 4 steps, no Mie (optimized for performance)
+vec3 atmos_inScatterSecondary(vec3 origin, vec3 dir, vec2 e, vec3 lightDir)
+{
+    const int N = 4;
+    const float K_R = 0.166;
+    const float K_M = 0.0;
+
+    float len = e.y / float(N);
+    vec3  stp = dir * len * 2.0;
+    vec3  v   = origin + dir * (len * 0.5);
+
+    float boosty = clamp(lightDir.y + 0.1, 0.0, 1.0) * 0.95 + 0.05;
+    boosty = 1.0 / sin(boosty);
+
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < N; ++i) {
+        vec2 f = atmos_RaySphere(v, lightDir, ATMOS_R);
+        vec3 u = v + lightDir * f.y;
+
+        float n = (atmos_optic(origin, v) + atmos_optic(v, u)) * (PI * 4.0);
+
+        sum += atmos_density(v) * exp(-n * (K_R * ATMOS_C_R + K_M));
+        v   += stp;
+    }
+    sum *= len * ATMOS_SCALE_L;
+
+    float c  = dot(dir, -lightDir);
+    float cc = c * c;
+    float phaseR = 0.75 * (1.0 + cc);
+    return sum * (K_R * ATMOS_C_R * phaseR) * ATMOS_E;
+}
+
+// Full SEUS-style sky colour for a given view direction and sun direction.
+// Matches AtmosphericScattering() in SEUS exactly, including the ambient fill
+// and the pow(x, 1.2) contrast curve.
+vec3 seusAtmosphere(vec3 rayDir, vec3 lightDir) {
+    // Eye just above the inner sphere (5 % up into the atmosphere shell)
+    vec3 eye = vec3(0.0, mix(ATMOS_R_INNER, ATMOS_R, 0.05), 0.0);
+
+    // Below-horizon: flatten to horizon rather than going underground
+    vec3 dir = rayDir;
+    if (dir.y < 0.0) dir.y = 0.0;
+
+    vec3 up  = vec3(0.0, 1.0, 0.0);
+
+    vec2 e    = atmos_RaySphere(eye, dir, ATMOS_R);
+    vec2 eup  = atmos_RaySphere(eye, up,  ATMOS_R);
+
+    vec3 atmosphere = atmos_inScatter(eye, dir, e, lightDir, 1.0, 1.0);
+
+    // Ambient fill from straight-up secondary scatter (SEUS uses dot * 0.86 * ambient)
+    vec3 secondary  = atmos_inScatterSecondary(eye, up, eup, lightDir);
+    // Deep blue ambient fill — matches real sky zenith color (Rayleigh dominated)
+    vec3 ambient    = vec3(0.20, 0.42, 1.0);
+    atmosphere     += dot(secondary, vec3(0.86)) * ambient;
+
+    // Color tint: reduce green channel further to push deep blue at zenith and
+    // stronger orange-red separation at the horizon (λ^-4 physics: green sits
+    // between red and blue, real sky has slightly greenish-blue at zenith but
+    // the blue strongly dominates). Reducing red slightly prevents washed-out look.
+    atmosphere *= vec3(0.82, 0.88, 1.0);
+    // Contrast curve 1.40: deepens blue dome without clipping sunset oranges
+    atmosphere  = pow(max(atmosphere, vec3(0.0)), vec3(1.40));
+
+    return atmosphere;
+}
+
+// Thin wrapper so getSkyBasic() can call a single function for both sun and moon passes.
+// (kept as a named function so the old `scatter()` call sites still compile)
+void scatter(vec3 o, vec3 d, vec3 lightsource, out vec3 raleigh, out vec3 themie, out float depthM){
+    // We route through seusAtmosphere() which already combines both contributions.
+    // Split output evenly so callers that do raleigh+mie still get the right total.
+    vec3 total = seusAtmosphere(d, lightsource);
+    raleigh = total * 0.6;
+    themie  = total * 0.4;
+    depthM  = 0.0; // not needed downstream
+}
+
+//-------------------Background and Stars--------------------
+
+vec3 nmzHash33(vec3 q)
+{
+    uvec3 p = uvec3(ivec3(q));
+    p = p*uvec3(374761393U, 1103515245U, 668265263U) + p.zxy + p.yzx;
+    p = p.yzx*(p.zxy^(p >> 3U));
+    return vec3(p^(p >> 16U))*(1.0/vec3(0xffffffffU));
+}
+
+// Simple procedural starfield generator (returns color vec3)
+vec3 stars(in vec3 p)
+{
+    vec3 c = vec3(0.0);
+    vec3 pp = p * 64.0; // scale to create many cells on the unit sphere
+    for(int i = 0; i < 4; ++i) {
+        vec3 id = floor(pp);
+        vec3 q = fract(pp) - 0.5;
+        vec2 rn = nmzHash33(id).xy;
+        float d = length(q);
+        float c2 = 1.0 - smoothstep(0.0, 0.6, d);
+        // threshold based on random value and octave to vary density
+        float thresh = 0.999 - float(i) * 0.0008 - rn.x * 0.0025;
+        if (rn.x > thresh) {
+            vec3 starCol = mix(vec3(1.0,0.49,0.1), vec3(0.75,0.9,1.0), rn.y) * (0.1) + vec3(0.9);
+            c += c2 * starCol;
+        }
+        pp *= 1.3;
+    }
+    return c * c * 0.8;
+}
+
+
+
+// Replaced basic sky with scattering-based variant using the Shadertoy-derived
+// `scatter()` implementation above. Signature changed to accept full
+// direction/position vectors. Callers were updated to pass `nEyePlayerPos` and
+// `skyPos` (both vec3).
+// `isSkyFragment` should be true when this call is for the sky itself
+// (so sun-related effects like the dark spot/ring are applied). When
+// false (terrain fragments), sun-area effects are suppressed to avoid
+// rendering through distant-horizon terrain.
+vec3 getSkyBasic(in vec3 nEyePlayerPos, in vec3 skyPos, in bool isSkyFragment){
+    // Fallback base — used for non-lit dimensions and as a night floor
+    vec3 currSkyCol = skyCol * dayCycleAdjust;
+
+    #if defined WORLD_LIGHT && WORLD_SUN_MOON == 1
+        vec3 camDir = normalize(nEyePlayerPos);
+
+        // sunDirScatter: always the TRUE sun direction for the scatter integrator.
+        // We never negate this — the integrator naturally handles sub-horizon sun.
+        // The raw shadow space +Z is always pointing toward the actual sun position.
+        vec3 sunDirScatter = normalize(transpose(mat3(shadowModelView)) * vec3(0., 0., 1.));
+        // When dayCycle < 1 the pack convention flips shadowModelView, so we must
+        // un-flip to get the real sun position for scatter.
+        #ifndef FORCE_DISABLE_DAY_CYCLE
+            if(dayCycle < 1.0) sunDirScatter = -sunDirScatter;
+        #endif
+        // True sun elevation: positive = above horizon, negative = below
+        float sunElev = sunDirScatter.y;
+
+        // ── SEUS AtmosphericScattering ──────────────────────────────────────
+        vec3 atmosphere = seusAtmosphere(camDir, sunDirScatter);
+
+        // Moon pass: anti-sun direction, active only at night
+        #ifndef FORCE_DISABLE_DAY_CYCLE
+            float nightDepth = clamp(1.0 - dayCycle, 0.0, 1.0);
+            atmosphere += seusAtmosphere(camDir, -sunDirScatter) * nightDepth * 0.00025;
+        #endif
+
+        atmosphere = clamp(atmosphere, vec3(0.0), vec3(16.0));
+
+        if(isSkyFragment) {
+            // Keep scatter visible all the way through sunset/sunrise.
+            // Old code: dayCycleAdjust * 2.0 — faded scatter out during sunset.
+            // New: keep full scatter while any part of the sky is lit, blend to
+            // night skyCol only when deeply into night (sunElev < -0.3).
+            float scatterBlend = clamp(sunElev * 4.0 + 1.0, 0.0, 1.0);
+            currSkyCol = mix(currSkyCol, atmosphere, scatterBlend);
+
+            // ── Sunset/sunrise limb saturation boost ─────────────────────────
+            // Max when sun is near horizon (|sunElev| small), zero at midday/midnight
+            float lowSunFact = clamp(1.0 - abs(sunElev) * 4.0, 0.0, 1.0)
+                             * clamp(sunElev + 0.3, 0.0, 1.0); // only sun side
+            float horizBand  = clamp(1.0 - abs(camDir.y) * 2.2, 0.0, 1.0);
+            vec3 limbTint    = mix(vec3(1.0), clamp(sunCol * 4.5 + vec3(0.3, -0.08, -0.5), 0.0, 10.0), 0.75);
+            currSkyCol      += currSkyCol * horizBand * lowSunFact * (limbTint - 1.0) * 0.75;
+
+            // ── Belt of Venus / twilight arch ─────────────────────────────────
+            // Active in a narrow window when sun is just below horizon
+            float twilight = smoothstep(0.12, 0.0, sunElev)
+                           * smoothstep(-0.28, -0.05, sunElev)
+                           * clamp(1.0 - camDir.y * 3.5, 0.0, 1.0);
+            currSkyCol += vec3(0.75, 0.48, 0.72) * 0.22 * twilight;
+
+            // ── Existing diffuse sun/moon tint ────────────────────────────────
+            #ifdef FORCE_DISABLE_DAY_CYCLE
+                if(skyPos.z > 0.0)
+                    currSkyCol += lightCol * pow(skyPos.z * skyPos.z, abs(nEyePlayerPos.y) + 1.0);
+            #else
+                float lightDiffuse       = pow(skyPos.z * skyPos.z, abs(nEyePlayerPos.y) + 1.0);
+                float diffuseCycleAdjust = dayCycleAdjust * lightDiffuse;
+                currSkyCol += skyPos.z > 0.0
+                    ? sunCol  * diffuseCycleAdjust
+                    : moonCol * (lightDiffuse - diffuseCycleAdjust);
+            #endif
+        }
+    #endif
+
+    currSkyCol += lightningFlash;
+
+    // ── Sun corona dark spot + bright ring ───────────────────────────────────
+    #ifdef WORLD_LIGHT
+        // Re-derive the true sun direction (same logic as above)
+        vec3 sunDirLocal = normalize(transpose(mat3(shadowModelView)) * vec3(0., 0., 1.));
+        #ifndef FORCE_DISABLE_DAY_CYCLE
+            if(dayCycle < 1.0) sunDirLocal = -sunDirLocal;
+        #endif
+
+        float cosAngle   = clamp(dot(normalize(nEyePlayerPos), sunDirLocal), -1.0, 1.0);
+        float ang        = acos(cosAngle);
+        float innerAngle = radians(0.2);
+        float outerAngle = radians(6.0);
+        float darkAmount = 0.05;
+
+        if (isSkyFragment && ang < outerAngle) {
+            float fall   = 0.0 - smoothstep(innerAngle, outerAngle, ang);
+            currSkyCol  *= mix(1.0 - darkAmount, 1.0, 1.0 - fall);
+
+            float ringRadius = radians(1.9);
+            float ringSigma  = radians(1.25);
+            float ring = exp(-((ang - ringRadius) * (ang - ringRadius)) / (2.0 * ringSigma * ringSigma));
+            #ifndef FORCE_DISABLE_DAY_CYCLE
+                vec3 ringTint = clamp(sunCol * 1.2, vec3(0.0), vec3(6.0));
+            #else
+                vec3 ringTint = clamp(lightCol * 1.2, vec3(0.0), vec3(6.0));
+            #endif
+            currSkyCol += ringTint * ring * (0.9 * fall);
+        }
+    #endif
+
+    // Night stars with gentle twinkling (only when night)
+    #ifdef WORLD_STARS
+    if(dayCycle < 1.0) {
+        // visibility scales with how deep into night it is
+        float nightVis = clamp(1.0 - dayCycle, 0.0, 1.0);
+        // sample procedural starfield function (Shadertoy port)
+        vec3 starDir = normalize(nEyePlayerPos);
+        vec3 starField = stars(starDir);
+
+        // Per-direction seed for asynchronous twinkle
+        float seed = fract(sin(dot(starDir.xz, vec2(12.9898,78.233))) * 43758.5453);
+        // Twinkle modulation (slow, varied per-seed)
+        float tw = 0.5 + 0.5 * sin(fragmentFrameTime * (1.8 + seed * 3.5) + seed * 12.34);
+        float twinkleStrength = mix(1.7, 1.6, tw);
+
+        // Apply twinkle and night visibility, keep values clamped
+        vec3 starCol = clamp(starField * twinkleStrength * nightVis * 1.2, vec3(0.0), vec3(6.0));
+
+        // Add to sky color (only a subtle amount so it doesn't overpower auroras or lightning)
+        // Apply only to sky fragments to avoid star glow through DH terrain
+        if (isSkyFragment) currSkyCol += starCol * 1.85;
+    }
+    #endif
+
+    return currSkyCol;
+}
+// Sky half render
+vec3 getSkyHalf(in vec3 nEyePlayerPos, in vec3 skyPos, in vec3 currSkyCol){
+    #if (defined WORLD_AETHER && defined WORLD_LIGHT) || defined WORLD_STARS
+        // Scaled by noise resolution
+        vec2 skyCoordScale = skyPos.xy * 256.0;
+    #endif
+
+    #if defined WORLD_AETHER && defined WORLD_LIGHT
+        int aetherAnimationSpeed = int(fragmentFrameTime * 8.0);
+
+        // Looks complex, but all it does is move the noise texture in 3 different directions
+        ivec2 aetherTexelCoord0 = ivec2(255 - skyCoordScale - aetherAnimationSpeed) & 255;
+        ivec2 aetherTexelCoord1 = ivec2(aetherTexelCoord0.x, int(skyCoordScale.y - aetherAnimationSpeed) & 255);
+        ivec2 aetherTexelCoord2 = ivec2(int(skyCoordScale.x - aetherAnimationSpeed) & 255, aetherTexelCoord0.y);
+
+        vec3 aetherNoise = vec3(texelFetch(noisetex, aetherTexelCoord0, 0).z,
+            texelFetch(noisetex, aetherTexelCoord1, 0).z,
+            texelFetch(noisetex, aetherTexelCoord2, 0).z);
+
+        currSkyCol += exp2(-abs(nEyePlayerPos.y) * 8.0) * cubed(aetherNoise * lightCol + sumOf(aetherNoise) * 0.66666666) * lightCol;
+    #endif
+
+    #ifdef WORLD_STARS
+        // Star field generation
+        vec2 starData = texelFetch(noisetex, ivec2(skyCoordScale / (abs(skyPos.z) + sqrt(1.0 - skyPos.z * skyPos.z))) & 255, 0).xy;
+        float stars = exp(starData.x * starData.y * 64.0 - 64.0);
+
+        #ifdef FORCE_DISABLE_WEATHER
+            currSkyCol += stars * WORLD_STARS;
+        #else
+            currSkyCol += (1.0 - rainStrength) * stars * WORLD_STARS;
+        #endif
+    #endif
+
+    return currSkyCol;
+}
+
+vec3 getSkyFogRender(in vec3 nEyePlayerPos){
+    // If player is in water, return the underwater fog color
+    if(isEyeInWater == 1) return UNDERWATER_FOG_COLOR;
+    // If player is in lava, return fog color
+    if(isEyeInWater == 2) return fogColor;
+
+    // Get sky pos by shadow model view
+    vec3 skyPos = mat3(shadowModelView) * nEyePlayerPos;
+
+    #if defined WORLD_LIGHT && !defined FORCE_DISABLE_DAY_CYCLE
+        // Flip if the sun has gone below the horizon
+        if(dayCycle < 1) skyPos.xz = -skyPos.xz;
+    #endif
+
+    // Get basic sky simple color (now uses scattering-based getSkyBasic)
+    vec3 currSkyCol = getSkyBasic(nEyePlayerPos, skyPos, true);
+
+    #if defined WORLD_AETHER && defined WORLD_LIGHT
+        // Scaled by noise resolution
+        vec2 skyCoordScale = skyPos.xy * 256.0;
+
+        int aetherAnimationSpeed = int(fragmentFrameTime * 8.0);
+
+        // Looks complex, but all it does is move the noise texture in 3 different directions
+        ivec2 aetherTexelCoord0 = ivec2(255 - skyCoordScale - aetherAnimationSpeed) & 255;
+        ivec2 aetherTexelCoord1 = ivec2(aetherTexelCoord0.x, int(skyCoordScale.y - aetherAnimationSpeed) & 255);
+        ivec2 aetherTexelCoord2 = ivec2(int(skyCoordScale.x - aetherAnimationSpeed) & 255, aetherTexelCoord0.y);
+
+        vec3 aetherNoise = vec3(texelFetch(noisetex, aetherTexelCoord0, 0).z,
+            texelFetch(noisetex, aetherTexelCoord1, 0).z,
+            texelFetch(noisetex, aetherTexelCoord2, 0).z);
+
+        currSkyCol += exp2(-abs(nEyePlayerPos.y) * 8.0) * cubed(aetherNoise * lightCol + sumOf(aetherNoise) * 0.66666666) * lightCol;
+    #endif
+
+
+
+    // Do a simple void gradient calculation
+    return currSkyCol * saturate(nEyePlayerPos.y + eyeBrightFact * 3.0 - 1.0);
+}
+
+// Fog color render
+vec3 getSkyFogRender(in vec3 nEyePlayerPos, in vec3 skyPos, in vec3 currSkyCol){
+    // If player is in water, return the underwater fog color
+    if(isEyeInWater == 1) return UNDERWATER_FOG_COLOR;
+    // If player is in lava, return fog color
+    if(isEyeInWater == 2) return fogColor;
+
+    #if defined WORLD_AETHER && defined WORLD_LIGHT
+        // Scaled by noise resolution
+        vec2 skyCoordScale = skyPos.xy * 256.0;
+
+        int aetherAnimationSpeed = int(fragmentFrameTime * 8.0);
+
+        // Looks complex, but all it does is move the noise texture in 3 different directions
+        ivec2 aetherTexelCoord0 = ivec2(255 - skyCoordScale - aetherAnimationSpeed) & 255;
+        ivec2 aetherTexelCoord1 = ivec2(aetherTexelCoord0.x, int(skyCoordScale.y - aetherAnimationSpeed) & 255);
+        ivec2 aetherTexelCoord2 = ivec2(int(skyCoordScale.x - aetherAnimationSpeed) & 255, aetherTexelCoord0.y);
+
+        vec3 aetherNoise = vec3(texelFetch(noisetex, aetherTexelCoord0, 0).z,
+            texelFetch(noisetex, aetherTexelCoord1, 0).z,
+            texelFetch(noisetex, aetherTexelCoord2, 0).z);
+
+        currSkyCol += exp2(-abs(nEyePlayerPos.y) * 8.0) * cubed(aetherNoise * lightCol + sumOf(aetherNoise) * 0.66666666) * lightCol;
+    #endif
+
+    // Do a simple void gradient calculation
+    return currSkyCol * saturate(nEyePlayerPos.y + eyeBrightFact * 3.0 - 1.0);
+}
+
+// Sun / Moon shape helpers
+// Overloads accept either the Z component (float) or the XY components (vec2)
+// and return a soft disk-shaped intensity in [0,1]. Tuned to be inexpensive
+// and visually reasonable across sky render paths.
+float getSunMoonShape(in float z){
+    // approximate angular radius by computing radius in XY from Z
+    float r = sqrt(max(0.0, 1.0 - z * z));
+    const float inner = 0.005;
+    const float outer = 0.105;
+    return 1.0 - smoothstep(inner, outer, r);
+}
+
+float getSunMoonShape(in vec2 xy){
+    float r = length(xy);
+    const float inner = 0.02;
+    const float outer = 0.03;
+    return 1.0 - smoothstep(inner, outer, r);
+}
+
+// ── DEDICATED SUN RENDERING FUNCTION ─────────────────────────────────────────
+// Renders a realistic sun disk with subtle halo and proper intensity control.
+// Input: skyPos (normalized direction in shadow space), sunCol (sun color)
+// Returns: rendered sun contribution
+vec3 renderSunDisk(in vec3 skyPos, in vec3 sunCol) {
+    // Angular radius approximation: 0.5° 
+    float r = sqrt(max(0.0, 1.0 - skyPos.z * skyPos.z));
+    
+    // Sharp disk with falloff
+    float diskCore = 1.0 - smoothstep(0.008, 0.011, r);
+    
+    // Halo: broader soft glow
+    float haloFalloff = exp(-(r * r) / (2.0 * 0.018 * 0.018));
+    
+    // Combine disk + halo with intensity weighting
+    float sunIntensity = diskCore * 2.2 + haloFalloff * 0.8;
+    
+    // Color multiplier to make sun more prominent but not blown-out
+    return sunCol * sunIntensity * 2.8;
+}
+
+// ── DEDICATED MOON RENDERING FUNCTION ────────────────────────────────────────
+// Renders a bright, visible moon disk with atmospheric glow.
+// Input: skyPos (normalized direction in shadow space), moonCol (moon color)
+// Returns: rendered moon contribution
+vec3 renderMoonDisk(in vec3 skyPos, in vec3 moonCol) {
+    // Angular radius approximation: 0.5° (same as sun)
+    float r = sqrt(max(0.0, 1.0 - skyPos.z * skyPos.z));
+    
+    // Sharp disk with smoother falloff for moon
+    float diskCore = 1.0 - smoothstep(0.007, 0.011, r);
+    
+    // Halo: softer for moon, includes atmosphere contribution
+    float haloFalloff = exp(-(r * r) / (2.0 * 0.020 * 0.020));
+    
+    // Moon intensity: brighter to be visible at night
+    float moonIntensity = diskCore * 2.1 + haloFalloff * 1.2;
+    
+    // Color multiplier - moon appears bright cyan-white
+    return moonCol * moonIntensity * 2.0;
+}
+
+// Sky reflection
+vec3 getSkyReflection(in vec3 reflectViewDir){
+    // If player is in lava, return fog color
+    if(isEyeInWater == 2) return fogColor;
+
+    vec3 reflectPlayerDir = mat3(gbufferModelViewInverse) * reflectViewDir;
+
+    // Rotate normalized player position to shadow space
+    vec3 skyPos = mat3(shadowModelView) * reflectPlayerDir;
+
+    #if defined WORLD_LIGHT && !defined FORCE_DISABLE_DAY_CYCLE
+        // Flip if the sun has gone below the horizon
+        if(dayCycle < 1) skyPos.xz = -skyPos.xz;
+    #endif
+
+    vec3 currSkyCol = getSkyBasic(reflectPlayerDir, skyPos, true);
+
+    #ifdef WORLD_LIGHT
+        #if WORLD_SUN_MOON == 1 && SUN_MOON_TYPE != 2
+            // If current world uses shader sun and moon but not vanilla sun and moon
+            #if SUN_MOON_TYPE == 1
+                // Slightly bigger shape for reflections
+                float r = sqrt(max(0.0, 1.0 - skyPos.z * skyPos.z));
+                const float inner = 0.005;
+                const float outer = 0.105;
+                float sunMoonShape = (1.0 - smoothstep(inner, outer, r)) * sunMoonIntensitySqrd;
+            #else
+                // Slightly bigger shape for reflections
+                float r = length(skyPos.xy);
+                const float inner = 0.005;
+                const float outer = 0.105;
+                float sunMoonShape = (1.0 - smoothstep(inner, outer, r)) * sunMoonIntensitySqrd;
+            #endif
+
+            #ifndef FORCE_DISABLE_WEATHER
+                #ifdef FORCE_DISABLE_DAY_CYCLE
+                    currSkyCol += sRGBLightCol * (sunMoonShape - rainStrength * sunMoonShape);
+                #else
+                    currSkyCol += (skyPos.z > 0 ? sRGBSunCol : sRGBMoonCol) * (sunMoonShape - rainStrength * sunMoonShape);
+                #endif
+            #endif
+        #elif WORLD_SUN_MOON == 2
+            float blackHole = sqrt(1.0 - skyPos.z * skyPos.z) - WORLD_SUN_MOON_SIZE;
+
+            // If black hole return nothing
+            if(blackHole <= 0) return vec3(0);
+            blackHole = 1.0 / max(1.0, blackHole * 256.0);
+
+            // Distortion application
+            const float rotationFactor = TAU * 16.0;
+            skyPos.xy = rot2D(blackHole * rotationFactor) * skyPos.xy;
+
+            float rings = textureLod(noisetex, vec2(skyPos.x * blackHole, fragmentFrameTime * 0.0009765625), 0).x;
+
+            currSkyCol += ((rings * blackHole * 0.9 + blackHole * 0.1) * sunMoonIntensitySqrd) * lightCol;
+        #endif
+    #endif
+
+    vec3 finalCol = getSkyHalf(reflectPlayerDir, skyPos, currSkyCol);
+
+    #if !defined FORCE_DISABLE_CLOUDS && defined WORLD_LIGHT
+        finalCol = getSkyClouds(reflectPlayerDir, finalCol);
+    #endif
+
+    // FIX: Add volumetric clouds to reflections
+    #if CLOUD_TYPE == 2 && !defined FORCE_DISABLE_CLOUDS && defined WORLD_LIGHT
+        // Use a screen-based dither for the reflection raymarch
+        float reflDither = texelFetch(noisetex, ivec2(gl_FragCoord.xy) & 255, 0).x;
+        // Raymarch the volumetric clouds for the reflected direction
+        vec4 volClouds = volumetricClouds(reflectPlayerDir, gbufferModelViewInverse[3].xyz, borderFar, reflDither, true);
+        // Blend the volumetric clouds over the sky/2D clouds
+        finalCol = mix(finalCol, volClouds.rgb, volClouds.a);
+    #endif
+
+    if(isEyeInWater == 1) return finalCol * max(0.0, reflectPlayerDir.y + eyeBrightFact - 1.0);
+
+    #ifdef WORLD_LIGHT
+        // Fake VL reflection
+        const float fakeVLBrightness = VOLUMETRIC_LIGHTING_STRENGTH * 0.5;
+        float VLBrightness = fakeVLBrightness * shdFade;
+
+        if(reflectPlayerDir.y > 0){
+            float heightFade = squared(squared(squared(1.0 - squared(reflectPlayerDir.y))));
+
+            #ifndef FORCE_DISABLE_WEATHER
+                heightFade += (1.0 - heightFade) * rainStrength * 0.5;
+            #endif
+
+            VLBrightness *= heightFade;
+        }
+        
+        finalCol += lightCol * VLBrightness;
+    #endif
+
+    return finalCol * saturate(reflectPlayerDir.y + eyeBrightFact * 3.0 - 1.0);
+}
+
+// Full sky render
+vec3 getFullSkyRender(in vec3 nEyePlayerPos, in vec3 skyPos, in vec3 currSkyCol){
+    // If player is in lava, return fog color
+    if(isEyeInWater == 2) return fogColor;
+
+    // Use original sky color system (now scattering-based)
+    currSkyCol = getSkyBasic(nEyePlayerPos, skyPos, true);
+
+    #ifdef WORLD_LIGHT
+        #if WORLD_SUN_MOON == 1 && SUN_MOON_TYPE != 2
+            // If current world uses shader sun and moon but not vanilla sun and moon
+            #ifndef FORCE_DISABLE_WEATHER
+                #ifdef FORCE_DISABLE_DAY_CYCLE
+                    // No day/night cycle: just render light (sun)
+                    vec3 lightContribution = renderSunDisk(skyPos, sRGBLightCol);
+                    currSkyCol += lightContribution * (1.0 - rainStrength);
+                #else
+                    // Day/night cycle: day uses sun, night uses moon
+                    if(skyPos.z > 0.0) {
+                        // Daytime: render sun with reduced brightness
+                        vec3 sunContribution = renderSunDisk(skyPos, sRGBSunCol) * dayCycleAdjust;
+                        currSkyCol += sunContribution * (1.0 - rainStrength * 0.5);
+                    } else {
+                        // Nighttime: render moon with full brightness
+                        vec3 moonContribution = renderMoonDisk(skyPos, sRGBMoonCol) * (1.0 - dayCycleAdjust);
+                        currSkyCol += moonContribution * (1.0 - rainStrength * 0.3);
+                    }
+                #endif
+            #endif
+        #elif WORLD_SUN_MOON == 2
+            float blackHole = sqrt(1.0 - skyPos.z * skyPos.z) - WORLD_SUN_MOON_SIZE;
+
+            // If black hole return nothing
+            if(blackHole <= 0) return vec3(0);
+            blackHole = 1.0 / max(1.0, blackHole * 256.0);
+
+            // Distortion application
+            const float rotationFactor = TAU * 16.0;
+            skyPos.xy = rot2D(blackHole * rotationFactor) * skyPos.xy;
+
+            float rings = textureLod(noisetex, vec2(skyPos.x * blackHole, fragmentFrameTime * 0.0009765625), 0).x;
+
+            currSkyCol += ((rings * blackHole * 0.9 + blackHole * 0.1) * sunMoonIntensitySqrd) * lightCol;
+        #endif
+    #endif
+
+    // Combine sky box color and sky half color
+    currSkyCol = getSkyHalf(nEyePlayerPos, skyPos, currSkyCol);
+
+    // Skybox clouds render in sky space (not volumetric ray-marched)
+    #if CLOUD_TYPE == 1 && !defined FORCE_DISABLE_CLOUDS && defined WORLD_LIGHT
+        currSkyCol = getSkyClouds(nEyePlayerPos, currSkyCol);
+    #endif
+
+
+
+    // Add Singularity blackhole effect only at night
+    if(dayCycle < 1.0 && nEyePlayerPos.y > 0.0){
+        // Compute UV coordinates from sky direction
+        vec2 uv = vec2(0.0, 0.5); // Centered in the sky
+        // Map to fragment coordinates
+        vec2 F = uv * vec2(800, 600);
+        vec4 sing = singularity(F, fragmentFrameTime);
+        float fadeFactor = 1.0 - dayCycle; // Fade in at night, fade out at sunrise
+        currSkyCol += sing.rgb * 1.0 * fadeFactor; // Brighter intensity
+    }
+
+    // Add shooting star effect always
+    if(true){
+        // Use linear sky position for straight path like sun and moon
+        vec2 skyUV = vec2(skyPos.x * 0.5 + 0.5, skyPos.y * 0.5 + 0.5);
+        // Always spawn
+        if(true){
+            const float ANIMATION_DURATION = 8.0; // seconds for star animation
+            const float fadeDuration = 0.5; // seconds for fade in/out
+            float timeInInterval = mod(fragmentFrameTime, 15.0);
+            if(timeInInterval < ANIMATION_DURATION){
+                float animationTime = timeInInterval;
+                // Animate star position from 0 to 1 (left to right) over animation duration
+                float starXPos = animationTime / ANIMATION_DURATION;
+                vec3 starCol = shootingStar(skyUV, fragmentFrameTime, starXPos);
+                // Fade in at start, full in middle, fade out at end
+                float fadeInDuration = fadeDuration; // seconds for fade in
+                float fullDuration = 8.0; // seconds fully visible
+                float fadeOutDuration = fadeDuration; // seconds for fade out
+                float fade = 4.0;
+                if(animationTime < fadeInDuration){
+                    fade = animationTime / fadeInDuration; // fade in 0-0.5
+                } else if(animationTime > ANIMATION_DURATION - fadeOutDuration){
+                    fade = (ANIMATION_DURATION - animationTime) / fadeOutDuration; // fade out 3.5-4.0
+                }
+                currSkyCol += starCol * fade * 3.0;
+
+                // Second shooting star behind the first one, appearing later
+                float secondTimeInInterval = mod(fragmentFrameTime - 0.5, 15.0); // Delay by 0.5 seconds
+                if(secondTimeInInterval < ANIMATION_DURATION){
+                    float secondAnimationTime = secondTimeInInterval;
+                    float secondStarXPos = secondAnimationTime / ANIMATION_DURATION;
+                    vec2 skyUV2 = vec2(skyPos.x * 0.5 + 0.5, (skyPos.y + 0.2) * 0.5 + 0.5);
+                    vec3 starCol2 = shootingStar(skyUV2, fragmentFrameTime, secondStarXPos);
+                    // Fade in at start and fade out at end
+                    float secondFade = 1.0;
+                    if(secondAnimationTime < fadeDuration){
+                        secondFade = secondAnimationTime / fadeDuration;
+                    } else if(secondAnimationTime > ANIMATION_DURATION - fadeDuration){
+                        secondFade = (ANIMATION_DURATION - secondAnimationTime) / fadeDuration;
+                    }
+                    currSkyCol += starCol2 * secondFade * 3.0; // Slightly dimmer
+                }
+            }
+        }
+    }
+
+    // Do a simple void gradient calculation when underwater
+    if(isEyeInWater == 1) return currSkyCol * saturate(nEyePlayerPos.y * 1.66666667 - 0.16666667);
+    return currSkyCol * saturate(nEyePlayerPos.y + eyeBrightFact * 3.0 - 1.0);
+}
