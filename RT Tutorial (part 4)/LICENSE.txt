@@ -1,0 +1,13 @@
+Some of this code is under the MIT license, some is public domain, so just assume everything is MIT if you don't want to think about it.
+
+The MIT license means that you can do whatever you want to with the code, including selling it, as long as you keep the notice of copyright and license in the code. In some files that notice is included as a single comment line, just leave that line somewhere in the file.
+
+it looks like this:
+
+// MIT License: Do Whatever you want to with this code as long as this line stays in the file. This file contains code Copyright © 2026 timetravelbeard (contact: https://www.patreon.com/timetravelbeard , https://youtube.com/@timetravelbeard3588 , https://discord.gg/S6F4r6K5yU )  Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions: The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software. THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+It's MIT now instead of purely being public domain just because making these tutorials is a lot of time and effort, and leaving a comment in your code isn't really an obstacle.
+
+I hope you enjoy and it's helpful!
+

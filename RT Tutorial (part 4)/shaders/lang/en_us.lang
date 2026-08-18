@@ -1,0 +1,12 @@
+option.DEBUG_ALIGHNMENT.comment = of texture reads. overrides other visualizations
+option.VISUALIZED_DATA.comment = 0-average color. 1-position. 2-one pixel's color. 3-light emission. 4-block type by id. 5-appoximated scene
+option.VOXEL_POSITION_RECONSTRUCTION_METHOD.comment 1-passed from vertex shader. 2-reconstructed with foot position & face normals
+option.WHERE_TO_VOXELIZE.comment = 1-Gbuffers. 2-Shadow pass
+screen.help= Help (hover_mouse)
+screen.help.comment = There is a READ ME file in the shader.zip that explains things. Or visit patreon.com/timetravelbeard and watch the free video series there or on Youtube. ask questions on my discord linked in both. Have Fun!
+
+value.RT_API.1 = naive
+value.RT_API.2 = DDA
+value.RT_API.3 = DDA - textured
+
+value.TEXTURES_IN_RT.2 = albedo

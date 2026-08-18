@@ -1,0 +1,22 @@
+RT TUTORIAL
+by timetravelbeard
+
+If you enjoy my stuff please consider leaving a tip or joining on my Patreon. Your support helps me to make cool stuff like this and try to regain the financial independence I had before my complicated spinal injury. You also get early access to all my other projects like my resource pack and shaders!
+
+If you want to make shaders you should also check out the shaderlabs discord, it's a great and active community where you can learn. There are template shaders to start from and a lot of help for all your questions. 
+Shader labs discord: https://discord.gg/ua4dheFJ
+
+If you have any questions or comments or suggestions, or want to join the community, please come by my discord: https://discord.gg/S6F4r6K5yU
+
+Have fun learning and making shaders!
+  -timetravelbeard
+
+
+All my links:
+https://www.patreon.com/timetravelbeard
+https://youtube.com/@timetravelbeard3588
+https://discord.gg/S6F4r6K5yU 
+
+
+
+Watching the Video Walkthroughs on Youtube is recommended. There should be a playlist for making minecraft shaders and one for making RT shaders (this).
